@@ -9,11 +9,13 @@
   body { font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', 'Consolas', monospace; background: #0a0f1a; color: #cbd5e1; overflow: hidden; }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
   @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-track { background: #0a0f1a; }
   ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 3px; }
   a { color: #0ea5e9; text-decoration: none; }
   a:hover { text-decoration: underline; }
+  .tooltip { pointer-events: none; animation: fadeIn 0.15s ease; }
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
@@ -25,14 +27,16 @@
 <script type="text/babel">
 const { useState, useRef, useEffect, useCallback, useMemo } = React;
 
-/* ─── Parsing ─── */
+/* ═══════════════════════════════════════════════════════════
+   PARSING & CLASSIFICATION
+   ═══════════════════════════════════════════════════════════ */
 function parseLineageText(text) {
   const lines = text.trim().split("\n").filter(l => l.trim());
   const nbMap = {};
   let current = null;
   for (const line of lines) {
     const trimmed = line.trim();
-    if (trimmed.startsWith("===") || trimmed.startsWith("LINEAGE:")) continue;
+    if (trimmed.startsWith("===") || trimmed.startsWith("LINEAGE:") || trimmed.startsWith("CROSS-NOTEBOOK")) continue;
     const nbMatch = trimmed.match(/^(?:\u{1F4D3}\s*)?(\S+)\s*:?\s*$/u);
     if (nbMatch && !trimmed.match(/^(WRITES|READS)\s/i)) {
       current = nbMatch[1]; nbMap[current] = { reads: [], writes: [] }; continue;
@@ -41,8 +45,8 @@ function parseLineageText(text) {
       const nm = trimmed.match(/^(nb_\w+)/); current = nm[1]; nbMap[current] = { reads: [], writes: [] };
     }
     if (!current) continue;
-    for (const m of trimmed.matchAll(/WRITES?\s*(?:->|→)\s*(\S+)/gi)) nbMap[current].writes.push(m[1].replace(/^dbo\./, ""));
-    for (const m of trimmed.matchAll(/READS?\s*(?:<-|←)\s*(\S+)/gi)) nbMap[current].reads.push(m[1].replace(/^dbo\./, ""));
+    for (const m of trimmed.matchAll(/WRITES?\s*(?:->|→)\s*(\S+)/gi)) nbMap[current].writes.push(m[1].replace(/^dbo\./, "").replace(/^SupplyChain_Lakehouse\.dbo\./, ""));
+    for (const m of trimmed.matchAll(/READS?\s*(?:<-|←)\s*(\S+)/gi)) nbMap[current].reads.push(m[1].replace(/^dbo\./, "").replace(/^SupplyChain_Lakehouse\.dbo\./, ""));
   }
   return nbMap;
 }
@@ -53,42 +57,95 @@ function classifyTable(name) {
   if (n.startsWith("slv_")) return "silver";
   if (n.startsWith("gld_dim_") || n.startsWith("dim_")) return "gold_dim";
   if (n.startsWith("gld_fact_") || n.startsWith("gld_") || n.startsWith("fact_")) return "gold_fact";
-  if (/^[A-Z]/.test(name)) return "external";
+  if (n.startsWith("utl_") || n.startsWith("ref_") || n.startsWith("stg_")) return "utility";
+  if (/^[A-Z]/.test(name) || ["source","parquet"].includes(n)) return "external";
   return "silver";
 }
 
-function getNodeType(name) {
+function getTableNodeType(name) {
   const c = classifyTable(name);
-  if (c === "gold_dim") return "dim";
-  if (c === "gold_fact") return "fact";
   if (c === "bronze" || c === "external") return "source";
   if (c === "silver") return "staging";
-  return "model";
+  if (c === "gold_dim") return "dim";
+  if (c === "gold_fact") return "fact";
+  if (c === "utility") return "utility";
+  return "staging";
+}
+
+function getNbVisualType(nbName) {
+  const n = nbName.toLowerCase();
+  if (n.startsWith("nb_brz_") || n.startsWith("nb_brz2_")) return "nb_brz";
+  if (n.startsWith("nb_slv_")) return "nb_slv";
+  if (n.startsWith("nb_gld_")) return "nb_gld";
+  if (n.startsWith("nb_utl_") || n.startsWith("nb_ult_")) return "nb_utl";
+  return "nb_other";
 }
 
 const TYPE_CONFIG = {
-  source:  { color: "#22c55e", label: "Source",  icon: "◇" },
-  staging: { color: "#3b82f6", label: "Staging", icon: "◆" },
-  dim:     { color: "#a78bfa", label: "Dim",     icon: "◈" },
-  fact:    { color: "#f59e0b", label: "Fact",     icon: "★" },
-  model:   { color: "#94a3b8", label: "Model",   icon: "●" },
+  source:   { color: "#22c55e", label: "Bronze/Src", icon: "◇", shape: "rect" },
+  staging:  { color: "#3b82f6", label: "Silver",     icon: "◆", shape: "rect" },
+  dim:      { color: "#a78bfa", label: "Dim",        icon: "◈", shape: "rect" },
+  fact:     { color: "#f59e0b", label: "Fact",        icon: "★", shape: "rect" },
+  utility:  { color: "#64748b", label: "Utility",     icon: "◎", shape: "rect" },
+  nb_brz:   { color: "#f97316", label: "NB Bronze",  icon: "⚙", shape: "pill" },
+  nb_slv:   { color: "#0ea5e9", label: "NB Silver",  icon: "⚙", shape: "pill" },
+  nb_gld:   { color: "#10b981", label: "NB Gold",    icon: "⚙", shape: "pill" },
+  nb_utl:   { color: "#8b5cf6", label: "NB Utility", icon: "⚙", shape: "pill" },
+  nb_other: { color: "#ec4899", label: "NB Other",   icon: "⚙", shape: "pill" },
 };
 
+const SKIP_TABLES = new Set(["source", "parquet", "activity", "code", "impact", "trace", "Parquet"]);
+
+/* ═══════════════════════════════════════════════════════════
+   GRAPH: Table → Notebook → Table
+   ═══════════════════════════════════════════════════════════ */
 function lineageToGraph(nbMap) {
-  const nodes = new Map(), edges = [];
-  const ensure = (name) => {
-    const clean = name.replace(/^dbo\./, "");
-    if (!nodes.has(clean)) nodes.set(clean, { id: clean, name: clean, type: getNodeType(clean) });
-    return clean;
+  const nodes = new Map();
+  const edges = [];
+  const edgeSet = new Set();
+
+  const addEdge = (from, to) => {
+    const k = `${from}→${to}`;
+    if (!edgeSet.has(k) && from !== to) { edgeSet.add(k); edges.push({ from, to }); }
   };
-  for (const [, info] of Object.entries(nbMap)) {
-    for (const w of info.writes) { const wId = ensure(w); for (const r of info.reads) { const rId = ensure(r); if (rId !== wId) edges.push({ from: rId, to: wId }); } }
+
+  for (const [nbName, info] of Object.entries(nbMap)) {
+    const reads = info.reads.filter(t => !SKIP_TABLES.has(t) && !SKIP_TABLES.has(t.toLowerCase()));
+    const writes = info.writes.filter(t => !SKIP_TABLES.has(t) && !SKIP_TABLES.has(t.toLowerCase()));
+
+    // Skip notebooks with no meaningful connections
+    if (reads.length === 0 && writes.length === 0) continue;
+
+    // Add notebook node
+    const nbType = getNbVisualType(nbName);
+    const nbLabel = nbName.replace(/^nb_/, "");
+    nodes.set(nbName, { id: nbName, name: nbLabel, fullName: nbName, type: nbType, isNb: true });
+
+    // Add read table nodes + edges: table → notebook
+    for (const t of reads) {
+      const clean = t.replace(/^dbo\./, "");
+      if (!nodes.has(clean)) {
+        nodes.set(clean, { id: clean, name: clean, fullName: clean, type: getTableNodeType(clean), isNb: false });
+      }
+      addEdge(clean, nbName);
+    }
+
+    // Add write table nodes + edges: notebook → table
+    for (const t of writes) {
+      const clean = t.replace(/^dbo\./, "");
+      if (!nodes.has(clean)) {
+        nodes.set(clean, { id: clean, name: clean, fullName: clean, type: getTableNodeType(clean), isNb: false });
+      }
+      addEdge(nbName, clean);
+    }
   }
-  const s = new Set();
-  return { nodes: Array.from(nodes.values()), edges: edges.filter(e => { const k = e.from+"→"+e.to; if (s.has(k)) return false; s.add(k); return true; }) };
+
+  return { nodes: Array.from(nodes.values()), edges };
 }
 
-/* ─── Notebook Extraction (ported from PowerShell) ─── */
+/* ═══════════════════════════════════════════════════════════
+   NOTEBOOK EXTRACTION (Fabric API + MSAL)
+   ═══════════════════════════════════════════════════════════ */
 const NB_SKIP_WORDS = new Set(['select','where','set','if','table','view','as','on','and','or',
   'not','null','true','false','case','when','then','else','end','group','order','by','having',
   'limit','union','all','distinct','exists','between','like','in','is','dual','temp','temporary',
@@ -108,43 +165,23 @@ function cleanNotebookContent(raw) {
 
 function matchAll(text, pattern) {
   const re = new RegExp(pattern.source, pattern.flags);
-  const results = [];
-  let m;
+  const results = []; let m;
   while ((m = re.exec(text)) !== null) results.push(m);
   return results;
 }
 
 function extractTablesFromContent(content) {
-  const tablesRead = new Set();
-  const tablesWrite = new Set();
-
-  // Extract SQL from spark.sql() BEFORE removing comments
+  const tablesRead = new Set(), tablesWrite = new Set();
   const sqlFragments = [];
   const reSparkSql = /spark\.sql\(\s*(?:f?"""([\s\S]*?)"""|f?'''([\s\S]*?)'''|f?"([^"]*)"|f?'([^']*)')\s*\)/g;
   let m;
-  while ((m = reSparkSql.exec(content)) !== null) {
-    const sql = m[1] || m[2] || m[3] || m[4];
-    if (sql) sqlFragments.push(sql);
-  }
+  while ((m = reSparkSql.exec(content)) !== null) { const sql = m[1]||m[2]||m[3]||m[4]; if(sql) sqlFragments.push(sql); }
+  content = content.replace(/--.*$/gm, ''); content = content.replace(/\/\*[\s\S]*?\*\//g, '');
+  for (let frag of sqlFragments) { frag = frag.replace(/--.*$/gm, ''); frag = frag.replace(/\/\*[\s\S]*?\*\//g, ''); content += "\n" + frag; }
 
-  // Remove comments
-  content = content.replace(/--.*$/gm, '');
-  content = content.replace(/\/\*[\s\S]*?\*\//g, '');
-
-  // Clean and append SQL fragments
-  for (let frag of sqlFragments) {
-    frag = frag.replace(/--.*$/gm, '');
-    frag = frag.replace(/\/\*[\s\S]*?\*\//g, '');
-    content += "\n" + frag;
-  }
-
-  // CTE names (to exclude from reads)
   const cteNames = new Set();
-  for (const m of matchAll(content, /(?:WITH|,)\s+([a-zA-Z_]\w*)\s+AS\s*\(/gi)) {
-    cteNames.add(m[1].toLowerCase());
-  }
+  for (const m of matchAll(content, /(?:WITH|,)\s+([a-zA-Z_]\w*)\s+AS\s*\(/gi)) cteNames.add(m[1].toLowerCase());
 
-  // Writes
   for (const m of matchAll(content, /(?:CREATE\s+(?:OR\s+REPLACE\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)`?([a-zA-Z_]\w*(?:\.\w+)*)`?/gi)) tablesWrite.add(m[1]);
   for (const m of matchAll(content, /(?:INSERT\s+(?:INTO|OVERWRITE)\s+(?:TABLE\s+)?)`?([a-zA-Z_]\w*(?:\.\w+)*)`?/gi)) tablesWrite.add(m[1]);
   for (const m of matchAll(content, /\.(?:saveAsTable|insertInto)\(["']([^"']+)["']\)/g)) tablesWrite.add(m[1]);
@@ -152,29 +189,23 @@ function extractTablesFromContent(content) {
   for (const m of matchAll(content, /DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?`?([a-zA-Z_]\w*(?:\.\w+)*)`?/gi)) tablesWrite.add(m[1]);
   for (const m of matchAll(content, /TRUNCATE\s+TABLE\s+`?([a-zA-Z_]\w*(?:\.\w+)*)`?/gi)) tablesWrite.add(m[1]);
 
-  // Reads
   for (const m of matchAll(content, /(?:FROM|(?:LEFT|RIGHT|INNER|OUTER|CROSS|FULL)\s+(?:OUTER\s+)?JOIN|JOIN)\s+`?([a-zA-Z_]\w*(?:\.\w+)*)`?/gi)) tablesRead.add(m[1]);
   for (const m of matchAll(content, /spark\.(?:read\.)?table\(["']([^"']+)["']\)/g)) tablesRead.add(m[1]);
   for (const m of matchAll(content, /DeltaTable\.forName\(\s*spark\s*,\s*["']([^"']+)["']\)/g)) tablesRead.add(m[1]);
   for (const m of matchAll(content, /DeltaTable\.forPath\(\s*spark\s*,\s*["']([^"']+)["']\)/g)) tablesRead.add(m[1]);
 
-  // Filter
   const skipSet = new Set([...NB_SKIP_WORDS, ...cteNames]);
   const filteredWrite = [...tablesWrite].filter(t => !skipSet.has(t.toLowerCase()) && t.length > 2);
   const writeSet = new Set(filteredWrite);
   const filteredRead = [...tablesRead].filter(t => !skipSet.has(t.toLowerCase()) && t.length > 2 && !writeSet.has(t));
-
   return { reads: filteredRead.sort(), writes: filteredWrite.sort() };
 }
 
-function fabricFetch(fabricPath, options = {}) {
-  return fetch(`https://api.fabric.microsoft.com/v1/${fabricPath}`, options);
-}
+function fabricFetch(fabricPath, options = {}) { return fetch(`https://api.fabric.microsoft.com/v1/${fabricPath}`, options); }
 
-// MSAL.js browser-based OAuth login (supports MFA)
 let msalInstance = null;
 async function loginViaBrowser(clientId) {
-  if (!clientId) throw new Error('Please enter a Client ID (Azure AD App Registration)');
+  if (!clientId) throw new Error('Please enter a Client ID');
   msalInstance = new msal.PublicClientApplication({
     auth: { clientId, authority: 'https://login.microsoftonline.com/organizations', redirectUri: window.location.href.split('?')[0].split('#')[0] },
     cache: { cacheLocation: 'sessionStorage' }
@@ -184,31 +215,18 @@ async function loginViaBrowser(clientId) {
   return tokenResp.accessToken;
 }
 
-async function fetchNotebookDefinition(token, workspaceId, notebookId, onLog) {
+async function fetchNotebookDefinition(token, workspaceId, notebookId) {
   const hdrs = { 'Authorization': `Bearer ${token}` };
-  const defnPath = `workspaces/${workspaceId}/notebooks/${notebookId}/getDefinition`;
-
-  const resp = await fabricFetch(defnPath, { method: 'POST', headers: hdrs });
-
+  const resp = await fabricFetch(`workspaces/${workspaceId}/notebooks/${notebookId}/getDefinition`, { method: 'POST', headers: hdrs });
   if (resp.ok) return await resp.json();
-
   if (resp.status === 202) {
     const loc = resp.headers.get('X-Location') || resp.headers.get('Location');
-    const retryAfter = parseInt(resp.headers.get('X-Retry-After') || resp.headers.get('Retry-After') || '3', 10);
+    const ra = parseInt(resp.headers.get('X-Retry-After') || resp.headers.get('Retry-After') || '3', 10);
     if (!loc) return null;
     for (let i = 0; i < 30; i++) {
-      await new Promise(r => setTimeout(r, retryAfter * 1000));
+      await new Promise(r => setTimeout(r, ra * 1000));
       const poll = await fetch(loc, { headers: hdrs });
-      if (poll.ok) {
-        const data = await poll.json();
-        if (data.status === 'Succeeded') {
-          const resultUrl = loc.replace(/\/$/, '') + '/result';
-          const result = await fetch(resultUrl, { headers: hdrs });
-          if (result.ok) return await result.json();
-          break;
-        }
-        if (data.status === 'Failed') break;
-      }
+      if (poll.ok) { const d = await poll.json(); if (d.status === 'Succeeded') { const r2 = await fetch(loc.replace(/\/$/, '') + '/result', { headers: hdrs }); if (r2.ok) return await r2.json(); break; } if (d.status === 'Failed') break; }
     }
   }
   return null;
@@ -217,97 +235,71 @@ async function fetchNotebookDefinition(token, workspaceId, notebookId, onLog) {
 async function extractAllNotebooks(token, workspaceId, prefix, onLog, signal) {
   const hdrs = { 'Authorization': `Bearer ${token}` };
   onLog('Fetching notebook list...');
-
-  const listPath = `workspaces/${workspaceId}/items?type=Notebook`;
-  const listResp = await fabricFetch(listPath, { headers: hdrs, signal });
-  if (!listResp.ok) throw new Error(`Failed to list notebooks: ${listResp.status}`);
-  const listData = await listResp.json();
-
-  const allNbs = listData.value || [];
+  const listResp = await fabricFetch(`workspaces/${workspaceId}/items?type=Notebook`, { headers: hdrs, signal });
+  if (!listResp.ok) throw new Error(`Failed: ${listResp.status}`);
+  const allNbs = (await listResp.json()).value || [];
   const notebooks = allNbs.filter(nb => nb.displayName.startsWith(prefix));
   onLog(`Found ${notebooks.length} notebooks with prefix "${prefix}" (total: ${allNbs.length})`);
-
-  const results = {};
-  const concurrency = 5;
-  let idx = 0;
-
+  const results = {}; let idx = 0;
   async function worker() {
     while (idx < notebooks.length) {
       if (signal?.aborted) return;
-      const i = idx++;
-      const nb = notebooks[i];
-      const nbName = nb.displayName;
+      const i = idx++; const nb = notebooks[i]; const nbName = nb.displayName;
       try {
-        const defn = await fetchNotebookDefinition(token, workspaceId, nb.id, onLog);
-        if (!defn) { onLog(`  SKIP: ${nbName} (no content)`); continue; }
-
-        // Parse notebook parts
+        const defn = await fetchNotebookDefinition(token, workspaceId, nb.id);
+        if (!defn) { onLog(`  SKIP: ${nbName}`); continue; }
         const parts = [];
-        const defParts = defn.definition?.parts || [];
-        for (const part of defParts) {
-          if (!part.payload) continue;
-          let decoded;
-          try { decoded = atob(part.payload); } catch { decoded = part.payload; }
-          try {
-            const nbJson = JSON.parse(decoded);
-            if (nbJson.cells) {
-              for (const cell of nbJson.cells) {
-                const src = cell.source;
-                if (Array.isArray(src)) parts.push(src.join(''));
-                else if (typeof src === 'string') parts.push(src);
-              }
-              continue;
-            }
-          } catch {}
+        for (const part of (defn.definition?.parts || [])) {
+          if (!part.payload) continue; let decoded; try { decoded = atob(part.payload); } catch { decoded = part.payload; }
+          try { const j = JSON.parse(decoded); if (j.cells) { for (const cell of j.cells) { const s = cell.source; if (Array.isArray(s)) parts.push(s.join('')); else if (typeof s === 'string') parts.push(s); } continue; } } catch {}
           parts.push(decoded);
         }
-
-        const rawContent = parts.join('\n');
-        const cleaned = cleanNotebookContent(rawContent);
+        const cleaned = cleanNotebookContent(parts.join('\n'));
         if (!cleaned.trim()) { onLog(`  SKIP: ${nbName}`); continue; }
-
         const lineage = extractTablesFromContent(cleaned);
-        if (lineage.reads.length > 0 || lineage.writes.length > 0) {
-          results[nbName] = lineage;
-          onLog(`  OK: ${nbName} (reads=${lineage.reads.length}, writes=${lineage.writes.length})`);
-        } else {
-          onLog(`  SKIP: ${nbName}`);
-        }
-      } catch (err) {
-        onLog(`  ERROR: ${nbName} - ${err.message}`);
-      }
+        if (lineage.reads.length > 0 || lineage.writes.length > 0) { results[nbName] = lineage; onLog(`  OK: ${nbName} (reads=${lineage.reads.length}, writes=${lineage.writes.length})`); }
+        else onLog(`  SKIP: ${nbName}`);
+      } catch (err) { onLog(`  ERROR: ${nbName} - ${err.message}`); }
     }
   }
-
-  const workers = [];
-  for (let w = 0; w < Math.min(concurrency, notebooks.length); w++) workers.push(worker());
-  await Promise.all(workers);
-
-  return results;
+  const workers = []; for (let w = 0; w < Math.min(5, notebooks.length); w++) workers.push(worker());
+  await Promise.all(workers); return results;
 }
 
 function buildLineageOutput(results) {
-  const sorted = Object.keys(results).sort();
-  const lines = [];
-  for (const nbName of sorted) {
-    const info = results[nbName];
-    lines.push(nbName);
+  return Object.keys(results).sort().map(nb => {
+    const info = results[nb]; const lines = [nb];
     for (const w of info.writes) lines.push(`  WRITES -> dbo.${w}`);
     for (const r of info.reads) lines.push(`  READS  <- dbo.${r}`);
-    lines.push('');
-  }
-  return lines.join('\n');
+    return lines.join('\n');
+  }).join('\n\n');
 }
 
-/* ─── DAG Layout ─── */
-function layoutDAG(nodes, edges, collapsed) {
-  const vis = nodes.filter(n => !collapsed.has(n.type));
+/* ═══════════════════════════════════════════════════════════
+   DAG LAYOUT ENGINE
+   ═══════════════════════════════════════════════════════════ */
+function layoutDAG(nodes, edges, collapsed, activeFilter) {
+  // Filter by type if active
+  let fn = nodes;
+  if (activeFilter && activeFilter !== "all") {
+    const rel = new Set();
+    nodes.forEach(n => { if (n.type === activeFilter) rel.add(n.id); });
+    // Include connected nodes
+    edges.forEach(e => { if (rel.has(e.from)) rel.add(e.to); if (rel.has(e.to)) rel.add(e.from); });
+    fn = nodes.filter(n => rel.has(n.id));
+  }
+
+  // Remove collapsed types
+  const vis = fn.filter(n => !collapsed.has(n.type));
   const vIds = new Set(vis.map(n => n.id));
   const vEdges = edges.filter(e => vIds.has(e.from) && vIds.has(e.to));
+
+  // Build adjacency
   const parents = new Map();
   vis.forEach(n => parents.set(n.id, []));
   vEdges.forEach(e => { if (parents.has(e.to)) parents.get(e.to).push(e.from); });
 
+  // Longest-path layering
   const layers = new Map(), done = new Set();
   function assign(id) {
     if (done.has(id)) return layers.get(id) || 0;
@@ -319,276 +311,401 @@ function layoutDAG(nodes, edges, collapsed) {
   }
   vis.forEach(n => assign(n.id));
 
+  // Group into columns
   const groups = new Map();
-  vis.forEach(n => { const l = layers.get(n.id)||0; if (!groups.has(l)) groups.set(l,[]); groups.get(l).push(n); });
-  const sorted = Array.from(groups.keys()).sort((a,b) => a-b);
-  const pos = new Map();
+  vis.forEach(n => { const l = layers.get(n.id) || 0; if (!groups.has(l)) groups.set(l, []); groups.get(l).push(n); });
+  const sorted = Array.from(groups.keys()).sort((a, b) => a - b);
 
+  // Sort within column by type then name
+  const typePriority = { source: 0, nb_brz: 1, staging: 2, nb_slv: 3, dim: 4, fact: 5, nb_gld: 6, utility: 7, nb_utl: 8, nb_other: 9 };
   sorted.forEach(l => {
-    groups.get(l).sort((a,b) => {
-      const o = {source:0,staging:1,dim:2,fact:3,model:4};
-      const d = (o[a.type]||9)-(o[b.type]||9);
-      return d!==0 ? d : a.name.localeCompare(b.name);
+    groups.get(l).sort((a, b) => {
+      const pa = typePriority[a.type] ?? 99, pb = typePriority[b.type] ?? 99;
+      return pa !== pb ? pa - pb : a.name.localeCompare(b.name);
     });
   });
 
-  for (let i=0;i<8;i++) {
-    for (let li=1;li<sorted.length;li++) {
-      const g = groups.get(sorted[li]), prev = groups.get(sorted[li-1]);
-      const po = new Map(); prev.forEach((n,i) => po.set(n.id,i));
+  // Barycenter ordering (reduce crossings)
+  for (let iter = 0; iter < 8; iter++) {
+    for (let li = 1; li < sorted.length; li++) {
+      const g = groups.get(sorted[li]), prev = groups.get(sorted[li - 1]);
+      const po = new Map(); prev.forEach((n, i) => po.set(n.id, i));
+      const bc = new Map();
       g.forEach(n => {
-        const p = (parents.get(n.id)||[]).filter(pp => po.has(pp));
-        if (p.length) pos.set(n.id, p.reduce((s,pp) => s+po.get(pp),0)/p.length);
+        const p = (parents.get(n.id) || []).filter(pp => po.has(pp));
+        if (p.length) bc.set(n.id, p.reduce((s, pp) => s + po.get(pp), 0) / p.length);
       });
-      g.sort((a,b) => (pos.get(a.id)||0)-(pos.get(b.id)||0));
+      g.sort((a, b) => (bc.get(a.id) ?? 999) - (bc.get(b.id) ?? 999));
     }
   }
 
-  const NW=220,NH=36,HG=100,VG=12;
+  // Assign positions
+  const NW = 230, NH = 34, HG = 90, VG = 10;
   const np = new Map();
   sorted.forEach(l => {
-    const g = groups.get(l), th = g.length*NH+(g.length-1)*VG, sy = -th/2;
-    g.forEach((n,i) => { np.set(n.id, {x:l*(NW+HG), y:sy+i*(NH+VG), w:NW, h:NH, node:n}); });
+    const g = groups.get(l);
+    const totalH = g.length * NH + (g.length - 1) * VG;
+    const startY = -totalH / 2;
+    g.forEach((n, i) => {
+      np.set(n.id, { x: l * (NW + HG), y: startY + i * (NH + VG), w: NW, h: NH, node: n });
+    });
   });
-  return { nodePositions:np, visibleEdges:vEdges, visibleNodes:vis };
+
+  return { nodePositions: np, visibleEdges: vEdges, visibleNodes: vis };
 }
 
-/* ─── Components ─── */
-function EdgePath({from,to,color,highlight,dim}) {
-  const x1=from.x+from.w+2,y1=from.y+from.h/2,x2=to.x-2,y2=to.y+to.h/2,mx=(x1+x2)/2;
+/* ═══════════════════════════════════════════════════════════
+   SVG COMPONENTS
+   ═══════════════════════════════════════════════════════════ */
+function EdgePath({ from, to, color, highlight, dim }) {
+  const x1 = from.x + from.w + 1, y1 = from.y + from.h / 2;
+  const x2 = to.x - 1, y2 = to.y + to.h / 2;
+  const mx = (x1 + x2) / 2;
   return <g>
     <path d={`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`} fill="none"
-      stroke={highlight?color:"#334155"} strokeWidth={highlight?2:1}
-      strokeOpacity={dim?0.06:highlight?0.8:0.25} style={{transition:"all 0.2s"}} />
-    {highlight && <polygon points={`${x2},${y2} ${x2-6},${y2-3.5} ${x2-6},${y2+3.5}`} fill={color} opacity={0.8}/>}
+      stroke={highlight ? color : "#334155"} strokeWidth={highlight ? 2 : 0.8}
+      strokeOpacity={dim ? 0.04 : highlight ? 0.8 : 0.2}
+      style={{ transition: "all 0.2s" }} />
+    {highlight && <polygon points={`${x2},${y2} ${x2 - 6},${y2 - 3} ${x2 - 6},${y2 + 3}`} fill={color} opacity={0.75} />}
   </g>;
 }
 
-function NodeBox({pos,isFocus,isConn,isDim,isSH,isSD,onHover,onSelect}) {
-  const cfg = TYPE_CONFIG[pos.node.type]||TYPE_CONFIG.model;
-  const tn = pos.node.name.length>28 ? pos.node.name.slice(0,26)+"..." : pos.node.name;
-  let bg="#111827",border="#1e293b",bw=1,op=1,tc="#cbd5e1";
-  if (isFocus) {bg=cfg.color+"1a";border=cfg.color;bw=2;tc="#f1f5f9";}
-  else if (isConn) {border=cfg.color+"66";tc="#e2e8f0";}
-  else if (isSH) {bg=cfg.color+"18";border=cfg.color;bw=2;}
-  if (isDim||isSD) op=0.15;
-  return <g className="nd" style={{cursor:"pointer"}} onMouseEnter={onHover} onMouseLeave={()=>onHover(null)} onClick={onSelect}>
-    <rect x={pos.x+1} y={pos.y+1} width={pos.w} height={pos.h} rx={8} fill="#000" opacity={op*0.2}/>
-    <rect x={pos.x} y={pos.y} width={pos.w} height={pos.h} rx={8} fill={bg} stroke={border} strokeWidth={bw} opacity={op} style={{transition:"all 0.2s"}}/>
-    <circle cx={pos.x+14} cy={pos.y+pos.h/2} r={4} fill={cfg.color} opacity={op*0.85}/>
-    <text x={pos.x+26} y={pos.y+pos.h/2+1} dominantBaseline="middle" fill={tc} fontSize={11} fontFamily="'JetBrains Mono',monospace" opacity={op}>{tn}</text>
+function NodeBox({ pos, isFocus, isConn, isDim, isSH, isSD, onHover, onSelect }) {
+  const cfg = TYPE_CONFIG[pos.node.type] || TYPE_CONFIG.staging;
+  const isNb = pos.node.isNb;
+  const rx = isNb ? 17 : 6;
+  const displayName = pos.node.name.length > 30 ? pos.node.name.slice(0, 28) + "…" : pos.node.name;
+
+  let bg = "#0f1520", border = "#1e293b", bw = 1, op = 1, tc = "#94a3b8";
+
+  if (isFocus) { bg = cfg.color + "18"; border = cfg.color; bw = 2.5; tc = "#f1f5f9"; }
+  else if (isConn) { border = cfg.color + "60"; tc = "#d1d5db"; bg = cfg.color + "08"; }
+  else if (isSH) { bg = cfg.color + "18"; border = cfg.color; bw = 2; }
+  if (isDim || isSD) op = 0.12;
+
+  return <g className="nd" style={{ cursor: "pointer" }}
+    onMouseEnter={onHover} onMouseLeave={() => onHover(null)} onClick={onSelect}>
+    {/* Shadow */}
+    <rect x={pos.x + 1.5} y={pos.y + 1.5} width={pos.w} height={pos.h} rx={rx} fill="#000" opacity={op * 0.15} />
+    {/* Main rect */}
+    <rect x={pos.x} y={pos.y} width={pos.w} height={pos.h} rx={rx}
+      fill={bg} stroke={border} strokeWidth={bw}
+      strokeDasharray={isNb ? "none" : "none"}
+      opacity={op} style={{ transition: "all 0.15s" }} />
+    {/* Layer dot */}
+    <circle cx={pos.x + 14} cy={pos.y + pos.h / 2} r={isNb ? 3.5 : 3} fill={cfg.color} opacity={op * 0.9} />
+    {/* Notebook gear icon */}
+    {isNb && <text x={pos.x + 24} y={pos.y + pos.h / 2 + 1} dominantBaseline="central"
+      fill={cfg.color} fontSize={10} opacity={op * 0.7} fontFamily="sans-serif">⚙</text>}
+    {/* Name */}
+    <text x={pos.x + (isNb ? 36 : 24)} y={pos.y + pos.h / 2 + 1} dominantBaseline="central"
+      fill={tc} fontSize={10.5} fontWeight={isNb ? 600 : 400}
+      fontFamily="'JetBrains Mono', monospace" opacity={op}
+      style={{ transition: "fill 0.15s" }}>
+      {displayName}
+    </text>
   </g>;
 }
 
-function DiagramCanvas({graph,collapsed,searchTerm,activeFilter}) {
-  const {nodePositions:np,visibleEdges:ve,visibleNodes:vn} = useMemo(() => {
-    let fn = graph.nodes;
-    if (activeFilter && activeFilter!=="all") {
-      const rel = new Set();
-      graph.nodes.forEach(n => {if(n.type===activeFilter)rel.add(n.id);});
-      graph.edges.forEach(e => {if(rel.has(e.from))rel.add(e.to);if(rel.has(e.to))rel.add(e.from);});
-      fn = graph.nodes.filter(n => rel.has(n.id));
-    }
-    return layoutDAG(fn, graph.edges, collapsed);
-  }, [graph,collapsed,activeFilter]);
+/* ═══════════════════════════════════════════════════════════
+   MAIN CANVAS
+   ═══════════════════════════════════════════════════════════ */
+function DiagramCanvas({ graph, collapsed, searchTerm, activeFilter }) {
+  const { nodePositions: np, visibleEdges: ve, visibleNodes: vn } = useMemo(
+    () => layoutDAG(graph.nodes, graph.edges, collapsed, activeFilter),
+    [graph, collapsed, activeFilter]
+  );
 
-  const [hov,setHov] = useState(null);
-  const [sel,setSel] = useState(null);
+  const [hov, setHov] = useState(null);
+  const [sel, setSel] = useState(null);
   const ref = useRef(null);
-  const [pan,setPan] = useState({x:0,y:0});
-  const [zoom,setZoom] = useState(1);
-  const [drag,setDrag] = useState(false);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [zoom, setZoom] = useState(1);
+  const [drag, setDrag] = useState(false);
   const ds = useRef(null);
-  const fid = sel||hov;
+  const fid = sel || hov;
 
+  // Build upstream+downstream set
   const conn = useMemo(() => {
     if (!fid) return new Set();
     const ids = new Set([fid]);
-    let q=[fid]; while(q.length){const c=q.shift();ve.forEach(e=>{if(e.to===c&&!ids.has(e.from)){ids.add(e.from);q.push(e.from);}});}
-    q=[fid]; while(q.length){const c=q.shift();ve.forEach(e=>{if(e.from===c&&!ids.has(e.to)){ids.add(e.to);q.push(e.to);}});}
+    // upstream
+    let q = [fid];
+    while (q.length) { const c = q.shift(); ve.forEach(e => { if (e.to === c && !ids.has(e.from)) { ids.add(e.from); q.push(e.from); } }); }
+    // downstream
+    q = [fid];
+    while (q.length) { const c = q.shift(); ve.forEach(e => { if (e.from === c && !ids.has(e.to)) { ids.add(e.to); q.push(e.to); } }); }
     return ids;
-  }, [fid,ve]);
+  }, [fid, ve]);
 
+  // Search matches
   const sm = useMemo(() => {
     if (!searchTerm) return null;
-    const s=searchTerm.toLowerCase(), ids=new Set();
-    vn.forEach(n=>{if(n.name.toLowerCase().includes(s))ids.add(n.id);});
-    return ids.size>0?ids:null;
-  }, [searchTerm,vn]);
+    const s = searchTerm.toLowerCase(), ids = new Set();
+    vn.forEach(n => { if (n.name.toLowerCase().includes(s) || n.id.toLowerCase().includes(s)) ids.add(n.id); });
+    return ids.size > 0 ? ids : null;
+  }, [searchTerm, vn]);
 
   const fitView = useCallback(() => {
-    if (!ref.current||np.size===0) return;
-    let a=Infinity,b=Infinity,c=-Infinity,d=-Infinity;
-    np.forEach(p=>{a=Math.min(a,p.x);b=Math.min(b,p.y);c=Math.max(c,p.x+p.w);d=Math.max(d,p.y+p.h);});
-    const gw=c-a+120,gh=d-b+120,cw=ref.current.clientWidth,ch=ref.current.clientHeight;
-    const fz=Math.min(cw/gw,ch/gh,1.2);
-    setZoom(fz);setPan({x:cw/2-((a+c)/2)*fz,y:ch/2-((b+d)/2)*fz});
-  },[np]);
+    if (!ref.current || np.size === 0) return;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    np.forEach(p => { minX = Math.min(minX, p.x); minY = Math.min(minY, p.y); maxX = Math.max(maxX, p.x + p.w); maxY = Math.max(maxY, p.y + p.h); });
+    const gw = maxX - minX + 140, gh = maxY - minY + 140;
+    const cw = ref.current.clientWidth, ch = ref.current.clientHeight;
+    const fz = Math.min(cw / gw, ch / gh, 1.5);
+    setZoom(fz);
+    setPan({ x: cw / 2 - ((minX + maxX) / 2) * fz, y: ch / 2 - ((minY + maxY) / 2) * fz });
+  }, [np]);
 
-  useEffect(()=>{fitView();},[fitView,graph,collapsed,activeFilter]);
-  useEffect(()=>{
-    const el=ref.current;if(!el)return;
-    const h=e=>{e.preventDefault();setZoom(z=>Math.max(0.08,Math.min(5,z*(e.deltaY>0?0.93:1.07))));};
-    el.addEventListener("wheel",h,{passive:false});return()=>el.removeEventListener("wheel",h);
-  },[]);
+  useEffect(() => { fitView(); }, [fitView, graph, collapsed, activeFilter]);
+  useEffect(() => {
+    const el = ref.current; if (!el) return;
+    const h = e => { e.preventDefault(); setZoom(z => Math.max(0.05, Math.min(6, z * (e.deltaY > 0 ? 0.92 : 1.08)))); };
+    el.addEventListener("wheel", h, { passive: false }); return () => el.removeEventListener("wheel", h);
+  }, []);
 
-  return <div ref={ref} style={{flex:1,overflow:"hidden",cursor:drag?"grabbing":"grab",position:"relative",background:"#0a0f1a"}}
-    onMouseDown={e=>{if(e.target.closest(".nd"))return;setDrag(true);ds.current={x:e.clientX-pan.x,y:e.clientY-pan.y};}}
-    onMouseMove={e=>{if(drag)setPan({x:e.clientX-ds.current.x,y:e.clientY-ds.current.y});}}
-    onMouseUp={()=>setDrag(false)} onMouseLeave={()=>setDrag(false)}
-    onClick={e=>{if(!e.target.closest(".nd"))setSel(null);}}>
+  // Tooltip data
+  const tooltipData = useMemo(() => {
+    if (!hov || !np.has(hov)) return null;
+    const p = np.get(hov);
+    const n = p.node;
+    const cfg = TYPE_CONFIG[n.type] || TYPE_CONFIG.staging;
+    const lines = [{ text: n.isNb ? n.fullName || n.name : n.name, bold: true, color: cfg.color }];
+    lines.push({ text: `Type: ${cfg.label}`, color: "#64748b" });
 
-    <div style={{position:"absolute",bottom:16,right:16,display:"flex",gap:4,zIndex:10}}>
-      {[{l:"+",f:()=>setZoom(z=>Math.min(5,z*1.25))},{l:"\u2212",f:()=>setZoom(z=>Math.max(0.08,z/1.25))},{l:"Fit",f:fitView}].map(b=>
-        <button key={b.l} onClick={b.f} style={{width:b.l==="Fit"?40:32,height:32,background:"#111827",border:"1px solid #1e293b",borderRadius:6,color:"#64748b",fontSize:b.l==="Fit"?11:15,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>{b.l}</button>
+    if (n.isNb) {
+      const reads = ve.filter(e => e.to === n.id).map(e => { const src = np.get(e.from); return src?.node?.name || e.from; });
+      const writes = ve.filter(e => e.from === n.id).map(e => { const tgt = np.get(e.to); return tgt?.node?.name || e.to; });
+      if (reads.length) lines.push({ text: `Reads ← ${reads.join(", ")}`, color: "#94a3b8" });
+      if (writes.length) lines.push({ text: `Writes → ${writes.join(", ")}`, color: "#94a3b8" });
+    } else {
+      const producers = ve.filter(e => e.to === n.id).map(e => { const src = np.get(e.from); return src?.node?.name || e.from; });
+      const consumers = ve.filter(e => e.from === n.id).map(e => { const tgt = np.get(e.to); return tgt?.node?.name || e.to; });
+      if (producers.length) lines.push({ text: `Written by: ${producers.join(", ")}`, color: "#94a3b8" });
+      if (consumers.length) lines.push({ text: `Read by: ${consumers.join(", ")}`, color: "#94a3b8" });
+    }
+
+    const upCount = ve.filter(e => e.to === n.id).length;
+    const downCount = ve.filter(e => e.from === n.id).length;
+    lines.push({ text: `↑ ${upCount} upstream · ↓ ${downCount} downstream`, color: "#475569" });
+
+    return { pos: p, lines, cfg };
+  }, [hov, np, ve]);
+
+  return <div ref={ref} style={{ flex: 1, overflow: "hidden", cursor: drag ? "grabbing" : "grab", position: "relative", background: "#0a0f1a" }}
+    onMouseDown={e => { if (e.target.closest(".nd")) return; setDrag(true); ds.current = { x: e.clientX - pan.x, y: e.clientY - pan.y }; }}
+    onMouseMove={e => { if (drag) setPan({ x: e.clientX - ds.current.x, y: e.clientY - ds.current.y }); }}
+    onMouseUp={() => setDrag(false)} onMouseLeave={() => setDrag(false)}
+    onClick={e => { if (!e.target.closest(".nd")) setSel(null); }}>
+
+    {/* Zoom controls */}
+    <div style={{ position: "absolute", bottom: 16, right: 16, display: "flex", gap: 4, zIndex: 10 }}>
+      {[
+        { l: "+", f: () => setZoom(z => Math.min(6, z * 1.25)) },
+        { l: "−", f: () => setZoom(z => Math.max(0.05, z / 1.25)) },
+        { l: "Fit", f: fitView }
+      ].map(b =>
+        <button key={b.l} onClick={b.f} style={{ width: b.l === "Fit" ? 40 : 32, height: 32, background: "#111827", border: "1px solid #1e293b", borderRadius: 6, color: "#64748b", fontSize: b.l === "Fit" ? 11 : 15, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{b.l}</button>
       )}
     </div>
 
-    {sel&&np.has(sel)&&<div style={{position:"absolute",bottom:16,left:16,background:"#111827ee",border:"1px solid #1e293b",borderRadius:8,padding:"10px 14px",fontSize:11,color:"#94a3b8",zIndex:10,maxWidth:300}}>
-      <div style={{color:TYPE_CONFIG[np.get(sel).node.type]?.color,fontWeight:700,marginBottom:4}}>{np.get(sel).node.name}</div>
-      <div>Type: {np.get(sel).node.type} · Up: {ve.filter(e=>e.to===sel).length} · Down: {ve.filter(e=>e.from===sel).length}</div>
-    </div>}
+    {/* Selection info panel */}
+    {sel && np.has(sel) && (() => {
+      const p = np.get(sel);
+      const n = p.node;
+      const cfg = TYPE_CONFIG[n.type] || TYPE_CONFIG.staging;
+      const upCount = [...conn].filter(id => { const pp = np.get(id); return pp && pp.x < p.x; }).length;
+      const downCount = [...conn].filter(id => { const pp = np.get(id); return pp && pp.x > p.x; }).length;
+      return <div style={{
+        position: "absolute", bottom: 16, left: "50%", transform: "translateX(-50%)",
+        background: "#111827ee", border: `1px solid ${cfg.color}33`, borderRadius: 10,
+        padding: "8px 16px", display: "flex", alignItems: "center", gap: 12,
+        fontSize: 11, color: "#94a3b8", zIndex: 10, backdropFilter: "blur(8px)",
+        boxShadow: "0 8px 32px rgba(0,0,0,0.4)", maxWidth: "90%",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <div style={{ width: 8, height: 8, borderRadius: n.isNb ? 8 : 2, background: cfg.color }} />
+          <span style={{ color: cfg.color, fontWeight: 700 }}>{n.isNb ? n.fullName || n.name : n.name}</span>
+          <span style={{ fontSize: 9, padding: "1px 6px", borderRadius: 4, background: cfg.color + "15", color: cfg.color, fontWeight: 600 }}>
+            {n.isNb ? "NOTEBOOK" : "TABLE"}
+          </span>
+        </div>
+        <div style={{ width: 1, height: 18, background: "#1e293b" }} />
+        <span><span style={{ color: "#a78bfa", fontWeight: 600 }}>↑ {upCount}</span> upstream</span>
+        <span><span style={{ color: "#4ade80", fontWeight: 600 }}>↓ {downCount}</span> downstream</span>
+      </div>;
+    })()}
 
-    <svg style={{position:"absolute",left:0,top:0,width:"100%",height:"100%"}}>
+    <svg style={{ position: "absolute", left: 0, top: 0, width: "100%", height: "100%" }}>
       <g transform={`translate(${pan.x},${pan.y}) scale(${zoom})`}>
-        {ve.map((e,i)=>{const f=np.get(e.from),t=np.get(e.to);if(!f||!t)return null;const hl=fid&&conn.has(e.from)&&conn.has(e.to);return<EdgePath key={i} from={f} to={t} color={(TYPE_CONFIG[t.node?.type]||TYPE_CONFIG.model).color} highlight={hl} dim={fid&&!hl}/>;})}
-        {Array.from(np.entries()).map(([id,pos])=>
-          <NodeBox key={id} pos={pos} isFocus={fid===id} isConn={conn.has(id)} isDim={fid&&!conn.has(id)} isSH={sm?.has(id)} isSD={sm&&!sm.has(id)}
-            onHover={v=>setHov(v===null?null:id)} onSelect={e=>{e.stopPropagation();setSel(sel===id?null:id);}}/>
+        {/* Edges */}
+        {ve.map((e, i) => {
+          const f = np.get(e.from), t = np.get(e.to);
+          if (!f || !t) return null;
+          const hl = fid && conn.has(e.from) && conn.has(e.to);
+          return <EdgePath key={i} from={f} to={t}
+            color={(TYPE_CONFIG[t.node?.type] || TYPE_CONFIG.staging).color}
+            highlight={hl} dim={fid && !hl} />;
+        })}
+
+        {/* Nodes */}
+        {Array.from(np.entries()).map(([id, pos]) =>
+          <NodeBox key={id} pos={pos}
+            isFocus={fid === id}
+            isConn={conn.has(id)}
+            isDim={fid && !conn.has(id)}
+            isSH={sm?.has(id)}
+            isSD={sm && !sm.has(id)}
+            onHover={v => setHov(v === null ? null : id)}
+            onSelect={e => { e.stopPropagation(); setSel(sel === id ? null : id); }} />
         )}
+
+        {/* Tooltip */}
+        {tooltipData && (() => {
+          const { pos, lines, cfg } = tooltipData;
+          const tw = 360, lh = 15;
+          const th = 8 + lines.length * lh + 6;
+          const tx = pos.x + pos.w / 2 - tw / 2;
+          const ty = pos.y + pos.h + 8;
+          return <g className="tooltip">
+            <rect x={tx - 8} y={ty} width={tw + 16} height={th} rx={7}
+              fill="#111827" stroke="#1e293b" strokeWidth={1} opacity={0.95} />
+            {lines.map((l, i) => (
+              <text key={i} x={tx} y={ty + 12 + i * lh}
+                fill={l.color} fontSize={l.bold ? 10.5 : 9} fontWeight={l.bold ? 700 : 400}
+                fontFamily="'JetBrains Mono', monospace">
+                {l.text.length > 58 ? l.text.slice(0, 57) + "…" : l.text}
+              </text>
+            ))}
+          </g>;
+        })()}
       </g>
     </svg>
   </div>;
 }
 
-/* ─── AI Chat ─── */
+/* ═══════════════════════════════════════════════════════════
+   AI CHAT PANEL
+   ═══════════════════════════════════════════════════════════ */
 function buildCtx(graph) {
-  const bt={},deps={};
-  graph.nodes.forEach(n=>{if(!bt[n.type])bt[n.type]=[];bt[n.type].push(n.name);});
-  graph.edges.forEach(e=>{if(!deps[e.to])deps[e.to]=[];deps[e.to].push(e.from);});
-  let c=`Lineage: ${graph.nodes.length} nodes, ${graph.edges.length} edges\n\nBy type:\n`;
-  for(const[t,ns]of Object.entries(bt))c+=`  ${t}: ${ns.join(", ")}\n`;
-  c+=`\nDeps (target <- sources):\n`;
-  for(const[t,ss]of Object.entries(deps))c+=`  ${t} <- ${ss.join(", ")}\n`;
-  const hp=new Set(graph.edges.map(e=>e.to)),hc=new Set(graph.edges.map(e=>e.from));
-  c+=`\nRoots: ${graph.nodes.filter(n=>!hp.has(n.id)).map(n=>n.name).join(", ")}\n`;
-  c+=`Leaves: ${graph.nodes.filter(n=>!hc.has(n.id)).map(n=>n.name).join(", ")}\n`;
+  const bt = {}, deps = {};
+  graph.nodes.forEach(n => { if (!bt[n.type]) bt[n.type] = []; bt[n.type].push(n.isNb ? `[NB] ${n.name}` : n.name); });
+  graph.edges.forEach(e => { if (!deps[e.to]) deps[e.to] = []; deps[e.to].push(e.from); });
+  let c = `Lineage: ${graph.nodes.length} nodes (tables + notebooks), ${graph.edges.length} edges\nFlow: Table → Notebook → Table\n\nBy type:\n`;
+  for (const [t, ns] of Object.entries(bt)) c += `  ${t}: ${ns.join(", ")}\n`;
+  c += `\nDeps (target <- sources):\n`;
+  for (const [t, ss] of Object.entries(deps)) c += `  ${t} <- ${ss.join(", ")}\n`;
+  const hp = new Set(graph.edges.map(e => e.to)), hc = new Set(graph.edges.map(e => e.from));
+  c += `\nRoots (no upstream): ${graph.nodes.filter(n => !hp.has(n.id)).map(n => n.name).join(", ")}\n`;
+  c += `Leaves (no downstream): ${graph.nodes.filter(n => !hc.has(n.id)).map(n => n.name).join(", ")}\n`;
   return c;
 }
 
-function ChatPanel({graph,onClose}) {
-  const [msgs,setMsgs]=useState([{role:"assistant",content:"Try asking:\n\u2022 \"Which tables feed into gld_fact_invoice_weekly?\"\n\u2022 \"Which tables have no downstream?\"\n\u2022 \"Trace the full lineage of slv_calendar\""}]);
-  const [inp,setInp]=useState("");
-  const [img,setImg]=useState(null); // {base64, preview}
-  const [key,setKey]=useState(localStorage.getItem('groq_key')||"");
-  const [showKey,setShowKey]=useState(!localStorage.getItem('groq_key'));
-  const [loading,setLoading]=useState(false);
-  const endRef=useRef(null);
+function ChatPanel({ graph, onClose }) {
+  const [msgs, setMsgs] = useState([{ role: "assistant", content: "Ask about lineage:\n• \"Which tables feed into gld_fact_invoice_weekly?\"\n• \"Trace the full chain of slv_calendar\"\n• \"Which notebooks write to gold tables?\"" }]);
+  const [inp, setInp] = useState("");
+  const [img, setImg] = useState(null);
+  const [key, setKey] = useState(localStorage.getItem('groq_key') || "");
+  const [showKey, setShowKey] = useState(!localStorage.getItem('groq_key'));
+  const [loading, setLoading] = useState(false);
+  const endRef = useRef(null);
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs]);
 
-  useEffect(()=>{endRef.current?.scrollIntoView({behavior:"smooth"});},[msgs]);
-
-  const handlePaste=(e)=>{
-    const items=e.clipboardData?.items;
-    if(!items)return;
-    for(const item of items){
-      if(item.type.startsWith('image/')){
+  const handlePaste = (e) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (const item of items) {
+      if (item.type.startsWith('image/')) {
         e.preventDefault();
-        const file=item.getAsFile();
-        const reader=new FileReader();
-        reader.onload=(ev)=>{
-          const base64=ev.target.result;
-          setImg({base64,preview:base64});
-        };
-        reader.readAsDataURL(file);
+        const reader = new FileReader();
+        reader.onload = (ev) => setImg({ base64: ev.target.result, preview: ev.target.result });
+        reader.readAsDataURL(item.getAsFile());
         return;
       }
     }
   };
 
-  const send = async()=>{
-    if((!inp.trim()&&!img)||loading||!key.trim())return;
-    const um=inp.trim();setInp("");
-    const hasImage=!!img;
-    const userContent=hasImage?[
-      ...(um?[{type:"text",text:um}]:[{type:"text",text:"Describe this image in the context of data lineage."}]),
-      {type:"image_url",image_url:{url:img.base64}}
-    ]:um;
-    const displayContent=um||(hasImage?"[Image]":"");
-    const userMsg={role:"user",content:userContent,_display:displayContent,_img:img?.preview};
+  const send = async () => {
+    if ((!inp.trim() && !img) || loading || !key.trim()) return;
+    const um = inp.trim(); setInp("");
+    const hasImage = !!img;
+    const userContent = hasImage ?
+      [...(um ? [{ type: "text", text: um }] : [{ type: "text", text: "Analyze this image in data lineage context." }]), { type: "image_url", image_url: { url: img.base64 } }] : um;
+    const userMsg = { role: "user", content: userContent, _display: um || (hasImage ? "[Image]" : ""), _img: img?.preview };
     setImg(null);
-    const nm=[...msgs,userMsg];setMsgs(nm);setLoading(true);
-    try{
-      const ctx=buildCtx(graph);
-      const sys=`You are a data lineage assistant.\n\n${ctx}\n\nAnswer concisely. Use node names. Trace upstream/downstream chains. Answer in user's language. If the user pastes an image, analyze it for any data lineage information (tables, columns, relationships, SQL, notebook code).`;
-      const model=hasImage?"meta-llama/llama-4-scout-17b-16e-instruct":"llama-3.3-70b-versatile";
-      const am=nm.filter((m,i)=>!(i===0&&m.role==="assistant")).map(m=>({role:m.role,content:m.content}));
-      const r=await fetch("https://api.groq.com/openai/v1/chat/completions",{
-        method:"POST",headers:{"Content-Type":"application/json","Authorization":`Bearer ${key.trim()}`},
-        body:JSON.stringify({model,messages:[{role:"system",content:sys},...am],max_tokens:1000,temperature:0.3})
+    const nm = [...msgs, userMsg]; setMsgs(nm); setLoading(true);
+    try {
+      const ctx = buildCtx(graph);
+      const sys = `You are a data lineage assistant.\n\n${ctx}\n\nAnswer concisely. Use node names. Trace upstream/downstream chains. Answer in user's language.`;
+      const model = hasImage ? "meta-llama/llama-4-scout-17b-16e-instruct" : "llama-3.3-70b-versatile";
+      const am = nm.filter((m, i) => !(i === 0 && m.role === "assistant")).map(m => ({ role: m.role, content: m.content }));
+      const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST", headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key.trim()}` },
+        body: JSON.stringify({ model, messages: [{ role: "system", content: sys }, ...am], max_tokens: 1000, temperature: 0.3 })
       });
-      if(!r.ok){const e=await r.json().catch(()=>({}));
-        if(r.status===401){setMsgs(p=>[...p,{role:"assistant",content:"Invalid API key."}]);setShowKey(true);}
-        else setMsgs(p=>[...p,{role:"assistant",content:`Error: ${e.error?.message||r.status}`}]);
-        setLoading(false);return;
+      if (!r.ok) {
+        const e = await r.json().catch(() => ({}));
+        if (r.status === 401) { setMsgs(p => [...p, { role: "assistant", content: "Invalid API key." }]); setShowKey(true); }
+        else setMsgs(p => [...p, { role: "assistant", content: `Error: ${e.error?.message || r.status}` }]);
+        setLoading(false); return;
       }
-      const d=await r.json();
-      setMsgs(p=>[...p,{role:"assistant",content:d.choices?.[0]?.message?.content||"No response."}]);
-    }catch(e){setMsgs(p=>[...p,{role:"assistant",content:"Connection error."}]);}
+      const d = await r.json();
+      setMsgs(p => [...p, { role: "assistant", content: d.choices?.[0]?.message?.content || "No response." }]);
+    } catch (e) { setMsgs(p => [...p, { role: "assistant", content: "Connection error." }]); }
     setLoading(false);
   };
 
-  const ms={alignSelf:"flex-start",maxWidth:"90%",background:"#111827",border:"1px solid #1e293b",borderRadius:"12px 12px 12px 4px",padding:"8px 12px",fontSize:11,lineHeight:1.6,color:"#94a3b8",whiteSpace:"pre-wrap",wordBreak:"break-word"};
+  const ms = { alignSelf: "flex-start", maxWidth: "90%", background: "#111827", border: "1px solid #1e293b", borderRadius: "12px 12px 12px 4px", padding: "8px 12px", fontSize: 11, lineHeight: 1.6, color: "#94a3b8", whiteSpace: "pre-wrap", wordBreak: "break-word" };
 
-  return <div style={{width:360,borderLeft:"1px solid #151d2e",background:"#0d1322",display:"flex",flexDirection:"column",flexShrink:0}}>
-    <div style={{height:44,borderBottom:"1px solid #151d2e",display:"flex",alignItems:"center",padding:"0 14px",gap:8}}>
-      <span style={{fontSize:14}}>{"\u2726"}</span>
-      <span style={{fontSize:12,fontWeight:700,color:"#e2e8f0"}}>AI Assistant</span>
-      <span style={{fontSize:9,color:"#0ea5e9",background:"#0ea5e911",padding:"2px 6px",borderRadius:4,border:"1px solid #0ea5e933"}}>Groq</span>
-      <div style={{flex:1}}/>
-      {key&&<button onClick={()=>setShowKey(!showKey)} style={{background:"none",border:"none",color:"#22c55e",cursor:"pointer",fontSize:10}}>{"\u25CF"} Connected</button>}
-      <button onClick={onClose} style={{background:"none",border:"none",color:"#475569",cursor:"pointer",fontSize:14}}>{"\u2715"}</button>
+  return <div style={{ width: 360, borderLeft: "1px solid #151d2e", background: "#0d1322", display: "flex", flexDirection: "column", flexShrink: 0 }}>
+    <div style={{ height: 44, borderBottom: "1px solid #151d2e", display: "flex", alignItems: "center", padding: "0 14px", gap: 8, flexShrink: 0 }}>
+      <span style={{ fontSize: 14 }}>✦</span>
+      <span style={{ fontSize: 12, fontWeight: 700, color: "#e2e8f0" }}>AI Assistant</span>
+      <span style={{ fontSize: 9, color: "#0ea5e9", background: "#0ea5e911", padding: "2px 6px", borderRadius: 4, border: "1px solid #0ea5e933" }}>Groq</span>
+      <div style={{ flex: 1 }} />
+      {key && <button onClick={() => setShowKey(!showKey)} style={{ background: "none", border: "none", color: "#22c55e", cursor: "pointer", fontSize: 10 }}>● Connected</button>}
+      <button onClick={onClose} style={{ background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 14 }}>✕</button>
     </div>
 
-    {showKey&&<div style={{padding:"10px 14px",borderBottom:"1px solid #151d2e",background:"#0a0f1a"}}>
-      <div style={{fontSize:10,color:"#475569",marginBottom:6}}>Groq API Key — <a href="https://console.groq.com/keys" target="_blank">Get a free key</a></div>
-      <div style={{display:"flex",gap:6}}>
-        <input type="password" value={key} onChange={e=>setKey(e.target.value)} placeholder="gsk_..." style={{flex:1,padding:"6px 10px",background:"#111827",border:"1px solid #1e293b",borderRadius:6,color:"#cbd5e1",fontSize:11,outline:"none"}}/>
-        <button onClick={()=>{if(key.trim()){localStorage.setItem('groq_key',key.trim());setShowKey(false);}}} style={{padding:"6px 12px",background:key?"#0ea5e922":"#1e293b",border:`1px solid ${key?"#0ea5e944":"#1e293b"}`,borderRadius:6,color:key?"#0ea5e9":"#475569",fontSize:11,fontWeight:700,cursor:"pointer"}}>Save</button>
+    {showKey && <div style={{ padding: "10px 14px", borderBottom: "1px solid #151d2e", background: "#0a0f1a" }}>
+      <div style={{ fontSize: 10, color: "#475569", marginBottom: 6 }}>Groq API Key — <a href="https://console.groq.com/keys" target="_blank">Get free key</a></div>
+      <div style={{ display: "flex", gap: 6 }}>
+        <input type="password" value={key} onChange={e => setKey(e.target.value)} placeholder="gsk_..." style={{ flex: 1, padding: "6px 10px", background: "#111827", border: "1px solid #1e293b", borderRadius: 6, color: "#cbd5e1", fontSize: 11, outline: "none" }} />
+        <button onClick={() => { if (key.trim()) { localStorage.setItem('groq_key', key.trim()); setShowKey(false); } }} style={{ padding: "6px 12px", background: key ? "#0ea5e922" : "#1e293b", border: `1px solid ${key ? "#0ea5e944" : "#1e293b"}`, borderRadius: 6, color: key ? "#0ea5e9" : "#475569", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>Save</button>
       </div>
-      <div style={{fontSize:9,color:"#334155",marginTop:4}}>Key is only stored in this session and never sent anywhere except Groq.</div>
     </div>}
 
-    <div style={{flex:1,overflow:"auto",padding:"12px 14px",display:"flex",flexDirection:"column",gap:10}}>
-      {msgs.map((m,i)=><div key={i} style={{...ms,alignSelf:m.role==="user"?"flex-end":"flex-start",background:m.role==="user"?"#1e3a5f":"#111827",border:`1px solid ${m.role==="user"?"#2563eb33":"#1e293b"}`,borderRadius:m.role==="user"?"12px 12px 4px 12px":"12px 12px 12px 4px",color:m.role==="user"?"#93c5fd":"#94a3b8"}}>
-        {m._img&&<img src={m._img} style={{maxWidth:'100%',borderRadius:6,marginBottom:4}} alt="pasted"/>}
-        {m._display||m.content}
+    <div style={{ flex: 1, overflow: "auto", padding: "12px 14px", display: "flex", flexDirection: "column", gap: 10 }}>
+      {msgs.map((m, i) => <div key={i} style={{ ...ms, alignSelf: m.role === "user" ? "flex-end" : "flex-start", background: m.role === "user" ? "#1e3a5f" : "#111827", border: `1px solid ${m.role === "user" ? "#2563eb33" : "#1e293b"}`, borderRadius: m.role === "user" ? "12px 12px 4px 12px" : "12px 12px 12px 4px", color: m.role === "user" ? "#93c5fd" : "#94a3b8" }}>
+        {m._img && <img src={m._img} style={{ maxWidth: '100%', borderRadius: 6, marginBottom: 4 }} alt="pasted" />}
+        {m._display || m.content}
       </div>)}
-      {loading&&<div style={{...ms,color:"#475569"}}><span style={{animation:"pulse 1.5s infinite"}}>Thinking...</span></div>}
-      <div ref={endRef}/>
+      {loading && <div style={{ ...ms, color: "#475569" }}><span style={{ animation: "pulse 1.5s infinite" }}>Thinking...</span></div>}
+      <div ref={endRef} />
     </div>
 
-    <div style={{borderTop:"1px solid #151d2e",padding:"10px 14px"}}>
-      {img&&<div style={{marginBottom:6,position:'relative',display:'inline-block'}}>
-        <img src={img.preview} style={{maxHeight:80,borderRadius:6,border:'1px solid #1e293b'}} alt="preview"/>
-        <button onClick={()=>setImg(null)} style={{position:'absolute',top:-4,right:-4,width:16,height:16,borderRadius:'50%',background:'#ef4444',border:'none',color:'#fff',fontSize:10,cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',lineHeight:1}}>{"\u2715"}</button>
+    <div style={{ borderTop: "1px solid #151d2e", padding: "10px 14px" }}>
+      {img && <div style={{ marginBottom: 6, position: 'relative', display: 'inline-block' }}>
+        <img src={img.preview} style={{ maxHeight: 80, borderRadius: 6, border: '1px solid #1e293b' }} alt="preview" />
+        <button onClick={() => setImg(null)} style={{ position: 'absolute', top: -4, right: -4, width: 16, height: 16, borderRadius: '50%', background: '#ef4444', border: 'none', color: '#fff', fontSize: 10, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>✕</button>
       </div>}
-      <div style={{display:"flex",gap:8}}>
-        <input value={inp} onChange={e=>setInp(e.target.value)} onPaste={handlePaste} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}}} placeholder={key?(img?"Add a message or just send...":"Ask about lineage... (paste image with Ctrl+V)"):"Enter API key first..."} disabled={!key} style={{flex:1,padding:"8px 12px",background:"#0a0f1a",border:"1px solid #1e293b",borderRadius:8,color:"#cbd5e1",fontSize:11,outline:"none",opacity:key?1:0.4}}/>
-        <button onClick={send} disabled={loading||(!inp.trim()&&!img)||!key} style={{padding:"8px 14px",background:loading?"#1e293b":"#0ea5e922",border:"1px solid #0ea5e944",borderRadius:8,color:loading?"#475569":"#0ea5e9",fontSize:11,fontWeight:700,cursor:loading||!key?"default":"pointer"}}>Send</button>
+      <div style={{ display: "flex", gap: 8 }}>
+        <input value={inp} onChange={e => setInp(e.target.value)} onPaste={handlePaste}
+          onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+          placeholder={key ? "Ask about lineage..." : "Enter API key first..."}
+          disabled={!key}
+          style={{ flex: 1, padding: "8px 12px", background: "#0a0f1a", border: "1px solid #1e293b", borderRadius: 8, color: "#cbd5e1", fontSize: 11, outline: "none", opacity: key ? 1 : 0.4 }} />
+        <button onClick={send} disabled={loading || (!inp.trim() && !img) || !key}
+          style={{ padding: "8px 14px", background: loading ? "#1e293b" : "#0ea5e922", border: "1px solid #0ea5e944", borderRadius: 8, color: loading ? "#475569" : "#0ea5e9", fontSize: 11, fontWeight: 700, cursor: loading || !key ? "default" : "pointer" }}>Send</button>
       </div>
     </div>
   </div>;
 }
 
-/* ─── CopyIcon ─── */
-function CopyIcon({size=14}) {
-  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
-  </svg>;
-}
-
-/* ─── Extract Panel ─── */
-function ExtractPanel({onClose, onLoadResults}) {
+/* ═══════════════════════════════════════════════════════════
+   EXTRACT PANEL
+   ═══════════════════════════════════════════════════════════ */
+function ExtractPanel({ onClose, onLoadResults }) {
   const [clientId, setClientId] = useState('f34fdf06-a095-4738-9f80-eeb81edc6e91');
   const [workspaceId, setWorkspaceId] = useState('c8d9fc83-18b6-4e1d-8264-0b49eed36fe0');
   const [prefix, setPrefix] = useState('nb_');
@@ -599,21 +716,17 @@ function ExtractPanel({onClose, onLoadResults}) {
   const [loggedIn, setLoggedIn] = useState(false);
   const logsEndRef = useRef(null);
   const abortRef = useRef(null);
-
-  useEffect(() => { logsEndRef.current?.scrollIntoView({behavior:'smooth'}); }, [logs]);
+  useEffect(() => { logsEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [logs]);
   const addLog = (msg) => setLogs(p => [...p, { time: new Date().toLocaleTimeString(), msg }]);
 
   const handleExtract = async () => {
-    if (!clientId.trim()) { addLog('ERROR: Please enter a Client ID'); return; }
-    if (!workspaceId.trim()) { addLog('ERROR: Please enter a Workspace ID'); return; }
+    if (!clientId.trim() || !workspaceId.trim()) { addLog('ERROR: Fill in all fields'); return; }
     setExtracting(true); setLogs([]); setResults(''); setCopied(false);
     abortRef.current = new AbortController();
     try {
       addLog('Opening Microsoft login popup...');
-      addLog('(Please sign in using the popup window)');
       const accessToken = await loginViaBrowser(clientId.trim());
-      addLog('Login successful!');
-      setLoggedIn(true);
+      addLog('Login successful!'); setLoggedIn(true);
       const extractResults = await extractAllNotebooks(accessToken, workspaceId.trim(), prefix, addLog, abortRef.current.signal);
       const count = Object.keys(extractResults).length;
       addLog(`\nDone! ${count} notebooks have lineage.`);
@@ -622,96 +735,220 @@ function ExtractPanel({onClose, onLoadResults}) {
       if (err.name !== 'AbortError') {
         addLog(`ERROR: ${err.message}`);
         if (err.message.includes('AADSTS700016')) addLog('Client ID not found in tenant.');
-        if (err.message.includes('redirect_uri') || err.message.includes('AADSTS900971')) addLog('Add Redirect URI: ' + window.location.origin + ' to App Registration → Authentication → SPA.');
+        if (err.message.includes('redirect_uri')) addLog('Add Redirect URI: ' + window.location.origin + ' to App Registration → Authentication → SPA.');
       }
     }
     setExtracting(false);
   };
 
   const handleCopy = async () => {
-    try { await navigator.clipboard.writeText(results); } catch {
-      const ta = document.createElement('textarea'); ta.value = results;
-      document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
-    }
+    try { await navigator.clipboard.writeText(results); } catch { const ta = document.createElement('textarea'); ta.value = results; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); }
     setCopied(true); setTimeout(() => setCopied(false), 2000);
   };
 
-  const inputStyle = {width:'100%',padding:'7px 10px',background:'#0a0f1a',border:'1px solid #1e293b',borderRadius:6,color:'#cbd5e1',fontSize:11,outline:'none',fontFamily:'inherit'};
-  const labelStyle = {fontSize:10,color:'#64748b',marginBottom:3,display:'block'};
+  const iS = { width: '100%', padding: '7px 10px', background: '#0a0f1a', border: '1px solid #1e293b', borderRadius: 6, color: '#cbd5e1', fontSize: 11, outline: 'none', fontFamily: 'inherit' };
+  const lS = { fontSize: 10, color: '#64748b', marginBottom: 3, display: 'block' };
 
-  return <div style={{width:400,borderLeft:'1px solid #151d2e',background:'#0d1322',display:'flex',flexDirection:'column',flexShrink:0,height:'100%'}}>
-    <div style={{height:44,borderBottom:'1px solid #151d2e',display:'flex',alignItems:'center',padding:'0 14px',gap:8,flexShrink:0}}>
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" strokeWidth={2}><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-      <span style={{fontSize:12,fontWeight:700,color:'#e2e8f0'}}>Extract Notebooks</span>
-      <div style={{flex:1}}/>
-      {loggedIn && <span style={{fontSize:9,color:'#22c55e',display:'flex',alignItems:'center',gap:3}}>{"\u25CF"} Logged in</span>}
-      <button onClick={onClose} style={{background:'none',border:'none',color:'#475569',cursor:'pointer',fontSize:14}}>{"\u2715"}</button>
+  return <div style={{ width: 400, borderLeft: '1px solid #151d2e', background: '#0d1322', display: 'flex', flexDirection: 'column', flexShrink: 0, height: '100%' }}>
+    <div style={{ height: 44, borderBottom: '1px solid #151d2e', display: 'flex', alignItems: 'center', padding: '0 14px', gap: 8, flexShrink: 0 }}>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" strokeWidth={2}><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
+      <span style={{ fontSize: 12, fontWeight: 700, color: '#e2e8f0' }}>Extract Notebooks</span>
+      <div style={{ flex: 1 }} />
+      {loggedIn && <span style={{ fontSize: 9, color: '#22c55e' }}>● Logged in</span>}
+      <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', fontSize: 14 }}>✕</button>
     </div>
 
-    <div style={{padding:'12px 14px',borderBottom:'1px solid #151d2e',flexShrink:0,display:'flex',flexDirection:'column',gap:8}}>
-      <div>
-        <label style={labelStyle}>Client ID <span style={{color:'#334155'}}>(Azure AD App Registration)</span></label>
-        <input value={clientId} onChange={e=>setClientId(e.target.value)} placeholder="Enter Client ID from Azure Portal" style={inputStyle} disabled={extracting}/>
+    <div style={{ padding: '12px 14px', borderBottom: '1px solid #151d2e', flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div><label style={lS}>Client ID <span style={{ color: '#334155' }}>(Azure AD App)</span></label>
+        <input value={clientId} onChange={e => setClientId(e.target.value)} style={iS} disabled={extracting} /></div>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <div style={{ flex: 1 }}><label style={lS}>Workspace ID</label><input value={workspaceId} onChange={e => setWorkspaceId(e.target.value)} style={iS} disabled={extracting} /></div>
+        <div style={{ width: 80 }}><label style={lS}>Prefix</label><input value={prefix} onChange={e => setPrefix(e.target.value)} style={iS} disabled={extracting} /></div>
       </div>
-      <div style={{display:'flex',gap:8}}>
-        <div style={{flex:1}}>
-          <label style={labelStyle}>Workspace ID</label>
-          <input value={workspaceId} onChange={e=>setWorkspaceId(e.target.value)} placeholder="workspace-guid" style={inputStyle} disabled={extracting}/>
-        </div>
-        <div style={{width:80}}>
-          <label style={labelStyle}>Prefix</label>
-          <input value={prefix} onChange={e=>setPrefix(e.target.value)} style={inputStyle} disabled={extracting}/>
-        </div>
-      </div>
-      <div style={{background:'#111827',borderRadius:8,padding:'8px 10px',border:'1px solid #1e293b'}}>
-        <div style={{fontSize:9,color:'#94a3b8',lineHeight:1.6}}>
-          Click <strong style={{color:'#f59e0b'}}>Login & Extract</strong> to open the Microsoft login popup. Supports MFA, SSO.
-        </div>
-        <div style={{fontSize:8,color:'#334155',marginTop:4}}>
-          Don't have a Client ID? Azure Portal → App registrations → New → Platform: SPA → Redirect URI: <code style={{color:'#475569'}}>{typeof window!=='undefined'?window.location.origin:''}</code> → API permissions: Power BI Service
-        </div>
+      <div style={{ background: '#111827', borderRadius: 8, padding: '8px 10px', border: '1px solid #1e293b' }}>
+        <div style={{ fontSize: 9, color: '#94a3b8', lineHeight: 1.6 }}>Click <strong style={{ color: '#f59e0b' }}>Login & Extract</strong> to open Microsoft popup. Supports MFA.</div>
+        <div style={{ fontSize: 8, color: '#334155', marginTop: 4 }}>Azure Portal → App registrations → Platform: SPA → Redirect URI: <code style={{ color: '#475569' }}>{typeof window !== 'undefined' ? window.location.origin : ''}</code></div>
       </div>
       {!extracting ?
-        <button onClick={handleExtract} disabled={!clientId.trim()} style={{padding:'8px 16px',background:clientId.trim()?'#f59e0b22':'#1e293b',border:`1px solid ${clientId.trim()?'#f59e0b55':'#1e293b'}`,borderRadius:6,color:clientId.trim()?'#f59e0b':'#475569',fontSize:11,fontWeight:700,cursor:clientId.trim()?'pointer':'default',display:'flex',alignItems:'center',justifyContent:'center',gap:6}}>
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-          Login & Extract
-        </button>
-        :
-        <button onClick={()=>{if(abortRef.current)abortRef.current.abort();setExtracting(false);addLog('Cancelled.');}} style={{padding:'8px 16px',background:'#ef444422',border:'1px solid #ef444455',borderRadius:6,color:'#ef4444',fontSize:11,fontWeight:700,cursor:'pointer'}}>
-          Cancel
-        </button>
+        <button onClick={handleExtract} disabled={!clientId.trim()} style={{ padding: '8px 16px', background: clientId.trim() ? '#f59e0b22' : '#1e293b', border: `1px solid ${clientId.trim() ? '#f59e0b55' : '#1e293b'}`, borderRadius: 6, color: clientId.trim() ? '#f59e0b' : '#475569', fontSize: 11, fontWeight: 700, cursor: clientId.trim() ? 'pointer' : 'default', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
+          Login & Extract</button>
+        : <button onClick={() => { if (abortRef.current) abortRef.current.abort(); setExtracting(false); addLog('Cancelled.'); }}
+          style={{ padding: '8px 16px', background: '#ef444422', border: '1px solid #ef444455', borderRadius: 6, color: '#ef4444', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>Cancel</button>
       }
     </div>
 
-    <div style={{flex:1,overflow:'auto',padding:'8px 14px',fontSize:10,fontFamily:'monospace',color:'#64748b',lineHeight:1.6,minHeight:0}}>
-      {logs.length===0&&!results&&<div style={{color:'#334155',textAlign:'center',marginTop:20,fontSize:10,lineHeight:1.8}}>Enter a Client ID then click "Login & Extract".</div>}
-      {logs.map((l,i)=><div key={i} style={{color:l.msg.startsWith('ERROR')?'#ef4444':l.msg.startsWith('  OK')?'#22c55e':l.msg.includes('successful')||l.msg.includes('Done!')?'#4ade80':'#64748b'}}>
-        <span style={{color:'#334155'}}>[{l.time}]</span> {l.msg}
-      </div>)}
-      {extracting&&<div style={{color:'#f59e0b'}}><span style={{display:'inline-block',animation:'spin 1s linear infinite'}}>{"⟳"}</span> Processing...</div>}
-      <div ref={logsEndRef}/>
+    <div style={{ flex: 1, overflow: 'auto', padding: '8px 14px', fontSize: 10, fontFamily: 'monospace', color: '#64748b', lineHeight: 1.6, minHeight: 0 }}>
+      {logs.length === 0 && !results && <div style={{ color: '#334155', textAlign: 'center', marginTop: 20, fontSize: 10 }}>Enter a Client ID then click "Login & Extract".</div>}
+      {logs.map((l, i) => <div key={i} style={{ color: l.msg.startsWith('ERROR') ? '#ef4444' : l.msg.startsWith('  OK') ? '#22c55e' : l.msg.includes('successful') || l.msg.includes('Done!') ? '#4ade80' : '#64748b' }}>
+        <span style={{ color: '#334155' }}>[{l.time}]</span> {l.msg}</div>)}
+      {extracting && <div style={{ color: '#f59e0b' }}><span style={{ display: 'inline-block', animation: 'spin 1s linear infinite' }}>⟳</span> Processing...</div>}
+      <div ref={logsEndRef} />
     </div>
 
-    {results&&<div style={{borderTop:'1px solid #151d2e',flexShrink:0,maxHeight:'40%',display:'flex',flexDirection:'column'}}>
-      <div style={{display:'flex',alignItems:'center',padding:'8px 14px',gap:8,borderBottom:'1px solid #1e293b'}}>
-        <span style={{fontSize:11,fontWeight:700,color:'#e2e8f0',flex:1}}>Results</span>
-        <button onClick={handleCopy} title="Copy" style={{display:'flex',alignItems:'center',gap:4,padding:'4px 10px',background:copied?'#22c55e22':'#111827',border:`1px solid ${copied?'#22c55e55':'#1e293b'}`,borderRadius:6,color:copied?'#4ade80':'#94a3b8',fontSize:10,cursor:'pointer',fontWeight:600}}>
-          {copied?<><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={3}><polyline points="20 6 9 17 4 12"/></svg> Copied!</>:<><CopyIcon size={12}/> Copy</>}
-        </button>
-        <button onClick={()=>{if(results)onLoadResults(results);}} title="Load directly into graph" style={{display:'flex',alignItems:'center',gap:4,padding:'4px 10px',background:'#3b82f622',border:'1px solid #3b82f655',borderRadius:6,color:'#60a5fa',fontSize:10,cursor:'pointer',fontWeight:600}}>
-          Load
-        </button>
+    {results && <div style={{ borderTop: '1px solid #151d2e', flexShrink: 0, maxHeight: '40%', display: 'flex', flexDirection: 'column' }}>
+      <div style={{ display: 'flex', alignItems: 'center', padding: '8px 14px', gap: 8, borderBottom: '1px solid #1e293b' }}>
+        <span style={{ fontSize: 11, fontWeight: 700, color: '#e2e8f0', flex: 1 }}>Results</span>
+        <button onClick={handleCopy} style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '4px 10px', background: copied ? '#22c55e22' : '#111827', border: `1px solid ${copied ? '#22c55e55' : '#1e293b'}`, borderRadius: 6, color: copied ? '#4ade80' : '#94a3b8', fontSize: 10, cursor: 'pointer', fontWeight: 600 }}>
+          {copied ? "✓ Copied!" : "Copy"}</button>
+        <button onClick={() => { if (results) onLoadResults(results); }}
+          style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '4px 10px', background: '#3b82f622', border: '1px solid #3b82f655', borderRadius: 6, color: '#60a5fa', fontSize: 10, cursor: 'pointer', fontWeight: 600 }}>Load</button>
       </div>
-      <textarea readOnly value={results} style={{flex:1,minHeight:100,padding:'8px 14px',background:'#0a0f1a',border:'none',color:'#94a3b8',fontSize:10,fontFamily:'monospace',resize:'none',outline:'none',lineHeight:1.5}}/>
+      <textarea readOnly value={results} style={{ flex: 1, minHeight: 100, padding: '8px 14px', background: '#0a0f1a', border: 'none', color: '#94a3b8', fontSize: 10, fontFamily: 'monospace', resize: 'none', outline: 'none', lineHeight: 1.5 }} />
     </div>}
   </div>;
 }
 
-/* ─── Sample ─── */
-const SAMPLE=`nb_gld_fact_invoice_weekly
+/* ═══════════════════════════════════════════════════════════
+   SAMPLE DATA (full)
+   ═══════════════════════════════════════════════════════════ */
+const SAMPLE = `nb_brz_Customers__AccountMaster
+  READS  <- Parquet
+
+nb_brz_Customers__ShippingLocations
+  READS  <- source
+
+nb_brz_MasterData_DW__DimDate
+  READS  <- source
+
+nb_brz_MasterData_DW__DimItemMaster
+  READS  <- source
+
+nb_brz_SalesHistory_AFI__InvoiceDetail
+  READS  <- source
+
+nb_brz_SupplyChain_DW__DimAFIWarehouses
+  READS  <- source
+
+nb_brz_SupplyChain_DW__DimCurrentProductDetails
+  READS  <- source
+
+nb_brz_Wholesale_Codis_AFI__AAORDTYP
+  READS  <- source
+
+nb_brz_Wholesale_Codis_AFI__COMAST
+  READS  <- source
+
+nb_brz_Wholesale_Codis_AFI__EXTORD
+  READS  <- source
+
+nb_brz_Wholesale_Codis_AFI__EXTORIT
+  READS  <- source
+
+nb_brz_Wholesale_Codis_AFI__codatan
+  READS  <- source
+
+nb_brz_Wholesale_ProductSourcing_AFI__CustomerGrouping
+  READS  <- source
+
+nb_slv_calendar
+  WRITES -> dbo.slv_calendar
+  READS  <- dbo.brz_masterdata_dw__dimdate
+
+nb_slv_customer_account
+  WRITES -> dbo.slv_customer_account
+  READS  <- dbo.brz_customers__accountmaster
+
+nb_slv_customer_grouping
+  WRITES -> dbo.slv_customer_grouping
+  READS  <- dbo.brz_wholesale_productsourcing_afi__customergrouping
+
+nb_slv_customer_shipping_location
+  WRITES -> dbo.slv_customer_shipping_location
+  READS  <- dbo.brz_customers__shippinglocations
+
+nb_slv_demand_forecast_snapshot
+  WRITES -> dbo.slv_demand_forecast_snapshot
+  READS  <- dbo.brz_supplychain_enh_1__demandforecastsnapshotdaily
+
+nb_slv_fcst_consensus_cycle_dates
+  WRITES -> dbo.slv_forecast_cycle
+  READS  <- dbo.brz_fcstconsensuscycledates
+
+nb_slv_invoice_detail
+  WRITES -> dbo.slv_invoice_detail
+  READS  <- dbo.brz_saleshistory_afi__invoicedetail
+
+nb_slv_item_master
+  WRITES -> dbo.slv_item_master
+  READS  <- dbo.brz_masterdata_dw__dimitemmaster
+
+nb_slv_open_order_detail
+  WRITES -> dbo.slv_open_order_detail
+  READS  <- dbo.brz_wholesale_codis_afi__codatan
+
+nb_slv_open_order_header
+  WRITES -> dbo.slv_open_order_header
+  READS  <- dbo.brz_wholesale_codis_afi__comast
+
+nb_slv_open_order_header_extended
+  WRITES -> slv_open_order_header_extended
+  READS  <- brz_wholesale_codis_afi__extord
+
+nb_slv_open_order_item_detail_extended
+  WRITES -> dbo.slv_open_order_item_detail_extended
+  READS  <- dbo.brz_wholesale_codis_afi__extorit
+
+nb_slv_order_type
+  WRITES -> dbo.slv_order_type
+  READS  <- dbo.brz_wholesale_codis_afi__aaordtyp
+
+nb_slv_product
+  WRITES -> dbo.slv_product
+  READS  <- dbo.brz_supplychain_dw__dimcurrentproductdetails
+
+nb_slv_warehouse
+  WRITES -> dbo.slv_warehouse
+  READS  <- dbo.brz_supplychain_dw__dimafiwarehouses
+
+nb_gld_dim_calendar
+  WRITES -> dbo.gld_dim_calendar
+  READS  <- dbo.slv_calendar
+
+nb_gld_dim_customer_group
+  WRITES -> dbo.gld_dim_customer_grouping
+  READS  <- dbo.slv_customer_grouping
+
+nb_gld_dim_product
+  WRITES -> dbo.gld_dim_product
+  READS  <- dbo.slv_product
+
+nb_gld_dim_warehouse
+  WRITES -> dbo.gld_dim_warehouse
+  READS  <- dbo.slv_warehouse
+
+nb_gld_fact_invoice_detail_line_level
+  WRITES -> dbo.gld_fact_invoice_detail_line_level
+  READS  <- dbo.slv_customer_grouping
+  READS  <- dbo.slv_invoice_detail
+
+nb_gld_fact_open_order_line_level
+  WRITES -> dbo.gld_fact_open_order_line_level
+  READS  <- dbo.slv_item_master
+  READS  <- dbo.slv_open_order_detail
+  READS  <- dbo.slv_open_order_header
+  READS  <- dbo.slv_open_order_header_extended
+  READS  <- dbo.slv_open_order_item_detail_extended
+  READS  <- dbo.slv_order_type
+
+nb_gld_fact_invoice_weekly
   WRITES -> dbo.gld_fact_invoice_weekly
   READS  <- dbo.gld_fact_invoice_detail_line_level
   READS  <- dbo.slv_calendar
+
+nb_gld_fact_actual_demand_monthly
+  WRITES -> dbo.gld_fact_actual_demand_monthly
+  READS  <- dbo.gld_fact_invoice_detail_line_level
+  READS  <- dbo.gld_fact_open_order_line_level
+  READS  <- dbo.slv_calendar
+  READS  <- dbo.slv_customer_grouping
+
+nb_gld_fact_actual_demand_weekly
+  WRITES -> dbo.gld_fact_actual_demand_weekly
+  READS  <- dbo.gld_fact_invoice_detail_line_level
+  READS  <- dbo.gld_fact_open_order_line_level
+  READS  <- dbo.slv_calendar
+  READS  <- dbo.slv_customer_grouping
 
 nb_gld_fact_open_order_monthly
   WRITES -> dbo.gld_fact_open_order_monthly
@@ -719,111 +956,176 @@ nb_gld_fact_open_order_monthly
   READS  <- dbo.slv_calendar
   READS  <- dbo.slv_customer_grouping
 
-nb_gld_dim_calendar
-  WRITES -> dbo.gld_dim_calendar
+nb_gld_fact_forecast_demand_monthly
+  WRITES -> dbo.gld_fact_forecast_demand_monthly
+  READS  <- dbo.slv_calendar
+  READS  <- dbo.slv_demand_forecast_snapshot
+  READS  <- dbo.slv_forecast_cycle
+
+nb_gld_fact_naive_forecast_monthly
+  WRITES -> dbo.gld_fact_naive_forecast_monthly
+  READS  <- dbo.gld_fact_actual_demand_monthly
   READS  <- dbo.slv_calendar
 
-nb_gld_dim_customer_group
-  WRITES -> dbo.gld_dim_customer_group
-  READS  <- dbo.slv_customer_grouping
+nb_gld_fact_flat_forecast_actual
+  WRITES -> dbo.gld_fact_flat_forecast_actual
+  READS  <- dbo.gld_fact_actual_demand_monthly
+  READS  <- dbo.gld_fact_forecast_demand_monthly
+  READS  <- dbo.gld_fact_naive_forecast_monthly
 
-nb_slv_calendar
-  WRITES -> dbo.slv_calendar
-  READS  <- dbo.brz2_MasterData_DW__DimDate
+nb_gld_fact_forecast_kpi_metric
+  WRITES -> dbo.gld_fact_fcst_accuracy_kpi_monthly
+  READS  <- dbo.gld_fact_actual_demand_monthly
+  READS  <- dbo.gld_fact_forecast_demand_monthly
+  READS  <- dbo.gld_fact_naive_forecast_monthly
 
-nb_slv_customer_grouping
-  WRITES -> dbo.slv_customer_grouping
-  READS  <- dbo.brz2_AFISales_DW__CustomerGrouping
+nb_actual_demand
+  WRITES -> dbo.slv_actual_demand
+  READS  <- dbo.brz2_AFISales_DW__DimCustomers
+  READS  <- dbo.brz2_AFISales_DW__FactOpenOrders
+  READS  <- dbo.brz2_Enterprise_DW__DimDate
+  READS  <- dbo.brz2_Wholesale_ProductSourcing_AFI__CustomerGrouping
+  READS  <- dbo.brz2_Wholesale_SalesHistory_AFI__InvoiceDetail
 
-nb_slv_invoice_detail
-  WRITES -> dbo.slv_invoice_detail
-  READS  <- dbo.brz2_AFISales_DW__InvoiceDetail`;
+nb_forecast_demand
+  WRITES -> dbo.slv_forecast_demand
+  READS  <- dbo.brz2_SupplyChain_Enh__DemandForecastSnapshot
 
-const hB={padding:"5px 12px",fontSize:11,background:"#111827",border:"1px solid #1e293b",borderRadius:6,color:"#64748b",cursor:"pointer"};
+nb_naive_forecast
+  WRITES -> dbo.slv_naive_forecast
+  READS  <- dbo.brz2_AFISales_DW__DimCustomers
+  READS  <- dbo.brz2_AFISales_DW__FactOpenOrders
+  READS  <- dbo.brz2_Enterprise_DW__DimDate
+  READS  <- dbo.brz2_Wholesale_ProductSourcing_AFI__CustomerGrouping
+  READS  <- dbo.brz2_Wholesale_SalesHistory_AFI__InvoiceDetail
 
-/* ─── App ─── */
+nb_dim_product
+  WRITES -> dbo.slv_dim_product
+  READS  <- dbo.brz2_SupplyChain_DW__DimCurrentProductDetails
+
+nb_flat_forecast_actual
+  WRITES -> dbo.gld_flat_forecast_actual
+  READS  <- dbo.slv_actual_demand
+  READS  <- dbo.slv_forecast_demand
+  READS  <- dbo.slv_naive_forecast
+
+nb_forecast_kpi
+  WRITES -> dbo.gld_forecast_kpi
+  READS  <- dbo.brz2_SupplyChain_Enh__DemandForecastSnapshot
+  READS  <- dbo.slv_actual_demand
+  READS  <- dbo.slv_forecast_demand
+  READS  <- dbo.slv_naive_forecast
+
+nb_utl_pipeline_metadata
+  WRITES -> SupplyChain_Lakehouse.dbo.utl_pipeline_metadata
+  READS  <- SupplyChain_Lakehouse.dbo.brz_SupplyChain_Enh_1__DemandForecastSnapshotDaily`;
+
+/* ═══════════════════════════════════════════════════════════
+   MAIN APP
+   ═══════════════════════════════════════════════════════════ */
+const hB = { padding: "5px 12px", fontSize: 11, background: "#111827", border: "1px solid #1e293b", borderRadius: 6, color: "#64748b", cursor: "pointer" };
+
 function App() {
-  const [graph,setGraph]=useState(()=>lineageToGraph(parseLineageText(SAMPLE)));
-  const [showImp,setShowImp]=useState(false);
-  const [impTxt,setImpTxt]=useState("");
-  const [search,setSearch]=useState("");
-  const [showSrc,setShowSrc]=useState(false);
-  const [collapsed,setCollapsed]=useState(new Set());
-  const [filter,setFilter]=useState("all");
-  const [showChat,setShowChat]=useState(false);
-  const [showExtract,setShowExtract]=useState(false);
+  const [graph, setGraph] = useState(() => lineageToGraph(parseLineageText(SAMPLE)));
+  const [showImp, setShowImp] = useState(false);
+  const [impTxt, setImpTxt] = useState("");
+  const [search, setSearch] = useState("");
+  const [showSrc, setShowSrc] = useState(false);
+  const [collapsed, setCollapsed] = useState(new Set());
+  const [filter, setFilter] = useState("all");
+  const [showChat, setShowChat] = useState(false);
+  const [showExtract, setShowExtract] = useState(false);
 
-  const tc=useMemo(()=>{const c={};graph.nodes.forEach(n=>{c[n.type]=(c[n.type]||0)+1;});return c;},[graph]);
+  const tc = useMemo(() => { const c = {}; graph.nodes.forEach(n => { c[n.type] = (c[n.type] || 0) + 1; }); return c; }, [graph]);
+  const nbCount = useMemo(() => graph.nodes.filter(n => n.isNb).length, [graph]);
+  const tblCount = useMemo(() => graph.nodes.filter(n => !n.isNb).length, [graph]);
 
-  const load=()=>{
-    try{const p=JSON.parse(impTxt);if(p.nodes&&p.edges){setGraph(p);setShowImp(false);setImpTxt("");return;}}catch{}
-    const nb=parseLineageText(impTxt);
-    if(Object.keys(nb).length>0){setGraph(lineageToGraph(nb));setShowImp(false);setImpTxt("");}
+  const load = () => {
+    try { const p = JSON.parse(impTxt); if (p.nodes && p.edges) { setGraph(p); setShowImp(false); setImpTxt(""); return; } } catch {}
+    const nb = parseLineageText(impTxt);
+    if (Object.keys(nb).length > 0) { setGraph(lineageToGraph(nb)); setShowImp(false); setImpTxt(""); }
     else alert("Could not parse input.");
   };
 
-  const loadFromExtract=(text)=>{
-    const nb=parseLineageText(text);
-    if(Object.keys(nb).length>0){setGraph(lineageToGraph(nb));setShowExtract(false);}
+  const loadFromExtract = (text) => {
+    const nb = parseLineageText(text);
+    if (Object.keys(nb).length > 0) { setGraph(lineageToGraph(nb)); setShowExtract(false); }
     else alert("Could not parse extracted data.");
   };
 
-  const exp=()=>{const b=new Blob([JSON.stringify(graph,null,2)],{type:"application/json"});const u=URL.createObjectURL(b);const a=document.createElement("a");a.href=u;a.download="lineage.json";a.click();URL.revokeObjectURL(u);};
+  const exp = () => { const b = new Blob([JSON.stringify(graph, null, 2)], { type: "application/json" }); const u = URL.createObjectURL(b); const a = document.createElement("a"); a.href = u; a.download = "lineage.json"; a.click(); URL.revokeObjectURL(u); };
+  const toggle = t => { setCollapsed(p => { const n = new Set(p); if (n.has(t)) n.delete(t); else n.add(t); return n; }); };
 
-  const toggle=t=>{setCollapsed(p=>{const n=new Set(p);if(n.has(t))n.delete(t);else n.add(t);return n;});};
-
-  return <div style={{height:"100vh",display:"flex",flexDirection:"column",background:"#0a0f1a",color:"#cbd5e1"}}>
-    <div style={{height:44,borderBottom:"1px solid #151d2e",display:"flex",alignItems:"center",padding:"0 16px",gap:10,background:"#0d1322",flexShrink:0}}>
-      <svg width="16" height="16" viewBox="0 0 16 16" style={{opacity:0.5}}>
-        <circle cx="3" cy="8" r="2" fill="#3b82f6"/><circle cx="8" cy="4" r="2" fill="#a78bfa"/>
-        <circle cx="8" cy="12" r="2" fill="#f59e0b"/><circle cx="13" cy="8" r="2" fill="#22c55e"/>
-        <line x1="5" y1="8" x2="6" y2="5" stroke="#334155"/><line x1="5" y1="8" x2="6" y2="11" stroke="#334155"/>
-        <line x1="10" y1="4" x2="11" y2="7" stroke="#334155"/><line x1="10" y1="12" x2="11" y2="9" stroke="#334155"/>
+  return <div style={{ height: "100vh", display: "flex", flexDirection: "column", background: "#0a0f1a" }}>
+    {/* ─── TOP BAR ─── */}
+    <div style={{ height: 44, borderBottom: "1px solid #151d2e", display: "flex", alignItems: "center", padding: "0 16px", gap: 10, background: "#0d1322", flexShrink: 0 }}>
+      <svg width="16" height="16" viewBox="0 0 16 16" style={{ opacity: 0.5 }}>
+        <circle cx="3" cy="8" r="2" fill="#3b82f6" /><circle cx="8" cy="4" r="2" fill="#a78bfa" />
+        <circle cx="8" cy="12" r="2" fill="#f59e0b" /><circle cx="13" cy="8" r="2" fill="#22c55e" />
+        <line x1="5" y1="8" x2="6" y2="5" stroke="#334155" /><line x1="5" y1="8" x2="6" y2="11" stroke="#334155" />
+        <line x1="10" y1="4" x2="11" y2="7" stroke="#334155" /><line x1="10" y1="12" x2="11" y2="9" stroke="#334155" />
       </svg>
-      <span style={{fontSize:13,fontWeight:700,color:"#e2e8f0"}}>Lineage</span>
-      <span style={{fontSize:10,color:"#475569"}}>{graph.nodes.length} nodes · {graph.edges.length} edges</span>
-      <div style={{flex:1}}/>
+      <span style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0" }}>Lineage</span>
+      <span style={{ fontSize: 10, color: "#475569" }}>{nbCount} notebooks · {tblCount} tables · {graph.edges.length} edges</span>
+      <div style={{ flex: 1 }} />
 
-      <div style={{display:"flex",gap:4}}>
-        <button onClick={()=>setFilter("all")} style={{...hB,background:filter==="all"?"#1e293b":"transparent",border:filter==="all"?"1px solid #334155":"1px solid transparent",color:filter==="all"?"#cbd5e1":"#475569",fontSize:10,padding:"3px 8px"}}>All</button>
-        {Object.entries(TYPE_CONFIG).map(([t,cfg])=>{
-          const cnt=tc[t]||0;if(!cnt)return null;const isA=filter===t,isC=collapsed.has(t);
-          return<button key={t} onClick={()=>setFilter(isA?"all":t)} onContextMenu={e=>{e.preventDefault();toggle(t);}}
-            style={{padding:"3px 8px",fontSize:10,borderRadius:6,cursor:"pointer",background:isA?cfg.color+"22":"transparent",border:`1px solid ${isA?cfg.color+"55":"transparent"}`,color:isC?"#334155":cfg.color,textDecoration:isC?"line-through":"none",display:"flex",alignItems:"center",gap:4}}>
-            <span style={{fontSize:8}}>{cfg.icon}</span>{cfg.label} ({cnt})
+      {/* Type filter buttons */}
+      <div style={{ display: "flex", gap: 3, flexWrap: "wrap" }}>
+        <button onClick={() => setFilter("all")} style={{ ...hB, padding: "3px 8px", fontSize: 10, background: filter === "all" ? "#1e293b" : "transparent", border: filter === "all" ? "1px solid #334155" : "1px solid transparent", color: filter === "all" ? "#cbd5e1" : "#475569" }}>All</button>
+        {Object.entries(TYPE_CONFIG).map(([t, cfg]) => {
+          const cnt = tc[t] || 0; if (!cnt) return null;
+          const isA = filter === t, isC = collapsed.has(t);
+          return <button key={t} onClick={() => setFilter(isA ? "all" : t)}
+            onContextMenu={e => { e.preventDefault(); toggle(t); }}
+            style={{ padding: "3px 8px", fontSize: 10, borderRadius: 6, cursor: "pointer", background: isA ? cfg.color + "22" : "transparent", border: `1px solid ${isA ? cfg.color + "55" : "transparent"}`, color: isC ? "#334155" : cfg.color, textDecoration: isC ? "line-through" : "none", display: "flex", alignItems: "center", gap: 3 }}>
+            <span style={{ fontSize: 8 }}>{cfg.icon}</span>{cfg.label} ({cnt})
           </button>;
         })}
       </div>
 
-      <div style={{width:1,height:20,background:"#1e293b",margin:"0 4px"}}/>
-      {showSrc&&<input autoFocus value={search} onChange={e=>setSearch(e.target.value)} placeholder="Filter nodes..." style={{width:160,padding:"4px 8px",background:"#111827",border:"1px solid #1e293b",borderRadius:5,color:"#cbd5e1",fontSize:11,outline:"none"}}/>}
-      <button onClick={()=>{setShowSrc(!showSrc);if(showSrc)setSearch("");}} style={{...hB,padding:"4px 8px"}}>{showSrc?"\u2715":"\u2315"}</button>
-      <button onClick={()=>{setShowExtract(!showExtract);if(!showExtract){setShowChat(false);}}} style={{...hB,background:showExtract?"#f59e0b22":"#111827",borderColor:showExtract?"#f59e0b55":"#1e293b",color:showExtract?"#f59e0b":"#64748b",fontWeight:700,display:"flex",alignItems:"center",gap:4}}>
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5}><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-        Extract
-      </button>
-      <button onClick={()=>setShowImp(!showImp)} style={{...hB,background:showImp?"#1e3a5f":"#111827",borderColor:showImp?"#3b82f6":"#1e293b",color:showImp?"#93c5fd":"#64748b"}}>Import</button>
+      <div style={{ width: 1, height: 20, background: "#1e293b", margin: "0 4px" }} />
+
+      {/* Search */}
+      {showSrc && <input autoFocus value={search} onChange={e => setSearch(e.target.value)} placeholder="Filter..."
+        style={{ width: 160, padding: "4px 8px", background: "#111827", border: "1px solid #1e293b", borderRadius: 5, color: "#cbd5e1", fontSize: 11, outline: "none" }} />}
+      <button onClick={() => { setShowSrc(!showSrc); if (showSrc) setSearch(""); }} style={{ ...hB, padding: "4px 8px" }}>{showSrc ? "✕" : "⌕"}</button>
+
+      {/* Extract */}
+      <button onClick={() => { setShowExtract(!showExtract); if (!showExtract) setShowChat(false); }}
+        style={{ ...hB, background: showExtract ? "#f59e0b22" : "#111827", borderColor: showExtract ? "#f59e0b55" : "#1e293b", color: showExtract ? "#f59e0b" : "#64748b", fontWeight: 700, display: "flex", alignItems: "center", gap: 4 }}>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5}><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
+        Extract</button>
+
+      {/* Import / Export */}
+      <button onClick={() => setShowImp(!showImp)} style={{ ...hB, background: showImp ? "#1e3a5f" : "#111827", borderColor: showImp ? "#3b82f6" : "#1e293b", color: showImp ? "#93c5fd" : "#64748b" }}>Import</button>
       <button onClick={exp} style={hB}>Export</button>
-      <button onClick={()=>{setShowChat(!showChat);if(!showChat){setShowExtract(false);}}} style={{...hB,background:showChat?"#7c3aed22":"#111827",borderColor:showChat?"#7c3aed55":"#1e293b",color:showChat?"#a78bfa":"#64748b",fontWeight:700}}>{"\u2726"} AI</button>
+
+      {/* AI */}
+      <button onClick={() => { setShowChat(!showChat); if (!showChat) setShowExtract(false); }}
+        style={{ ...hB, background: showChat ? "#7c3aed22" : "#111827", borderColor: showChat ? "#7c3aed55" : "#1e293b", color: showChat ? "#a78bfa" : "#64748b", fontWeight: 700 }}>✦ AI</button>
     </div>
 
-    {showImp&&<div style={{borderBottom:"1px solid #151d2e",background:"#0d1322",padding:"12px 16px",display:"flex",gap:10,flexShrink:0}}>
-      <textarea value={impTxt} onChange={e=>setImpTxt(e.target.value)} rows={5} placeholder={"Paste lineage output:\n\nnb_xxx\n  WRITES -> dbo.table\n  READS  <- dbo.table"} style={{flex:1,background:"#0a0f1a",border:"1px solid #1e293b",borderRadius:6,color:"#cbd5e1",padding:10,fontSize:11,resize:"vertical",outline:"none"}}/>
-      <div style={{display:"flex",flexDirection:"column",gap:6}}>
-        <button onClick={load} style={{...hB,background:"#16a34a22",borderColor:"#16a34a55",color:"#4ade80",padding:"8px 16px",fontWeight:700}}>Load</button>
-        <button onClick={()=>setImpTxt("")} style={{...hB,padding:"8px 16px"}}>Clear</button>
+    {/* Import textarea */}
+    {showImp && <div style={{ borderBottom: "1px solid #151d2e", background: "#0d1322", padding: "12px 16px", display: "flex", gap: 10, flexShrink: 0 }}>
+      <textarea value={impTxt} onChange={e => setImpTxt(e.target.value)} rows={5}
+        placeholder={"Paste lineage output:\n\nnb_xxx\n  WRITES -> dbo.table\n  READS  <- dbo.table"}
+        style={{ flex: 1, background: "#0a0f1a", border: "1px solid #1e293b", borderRadius: 6, color: "#cbd5e1", padding: 10, fontSize: 11, resize: "vertical", outline: "none" }} />
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <button onClick={load} style={{ ...hB, background: "#16a34a22", borderColor: "#16a34a55", color: "#4ade80", padding: "8px 16px", fontWeight: 700 }}>Load</button>
+        <button onClick={() => setImpTxt("")} style={{ ...hB, padding: "8px 16px" }}>Clear</button>
       </div>
     </div>}
 
-    <div style={{flex:1,display:"flex",overflow:"hidden"}}>
-      <DiagramCanvas graph={graph} collapsed={collapsed} searchTerm={search} activeFilter={filter}/>
-      {showChat&&<ChatPanel graph={graph} onClose={()=>setShowChat(false)}/>}
-      {showExtract&&<ExtractPanel onClose={()=>setShowExtract(false)} onLoadResults={loadFromExtract}/>}
+    {/* Main content */}
+    <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+      <DiagramCanvas graph={graph} collapsed={collapsed} searchTerm={search} activeFilter={filter} />
+      {showChat && <ChatPanel graph={graph} onClose={() => setShowChat(false)} />}
+      {showExtract && <ExtractPanel onClose={() => setShowExtract(false)} onLoadResults={loadFromExtract} />}
     </div>
   </div>;
 }
 
-ReactDOM.render(<App/>, document.getElementById("root"));
+ReactDOM.render(<App />, document.getElementById("root"));
 </script>
 </body>
 </html>
